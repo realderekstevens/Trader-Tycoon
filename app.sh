@@ -1159,8 +1159,47 @@ p3_seed_starting_ship() {
     fi
 }
 
+# ── Drop all tables / views / functions (hard reset) ─────────────────────
+p3_drop_tables() {
+    info "Dropping all Patrician III + IV objects…"
+    p3_psql <<'SQL'
+-- Views first (depend on tables)
+DROP VIEW IF EXISTS p3_arbitrage_view CASCADE;
+DROP VIEW IF EXISTS p3_market_view    CASCADE;
+DROP VIEW IF EXISTS p3_fleet_view     CASCADE;
+
+-- Functions
+DROP FUNCTION IF EXISTS p3_marginal_price(INT,INT,TEXT,INT,INT) CASCADE;
+DROP FUNCTION IF EXISTS p3_travel_days(INT,INT,NUMERIC)         CASCADE;
+DROP FUNCTION IF EXISTS p3_hex_neighbors(INT,INT)               CASCADE;
+DROP FUNCTION IF EXISTS p3_hex_distance(INT,INT,INT,INT)        CASCADE;
+
+-- Tables in reverse-FK order (CASCADE handles any stragglers)
+DROP TABLE IF EXISTS p3_trade_log        CASCADE;
+DROP TABLE IF EXISTS p3_limit_orders     CASCADE;
+DROP TABLE IF EXISTS p3_ship_orders      CASCADE;
+DROP TABLE IF EXISTS p3_ship_routes      CASCADE;
+DROP TABLE IF EXISTS p3_route_orders     CASCADE;
+DROP TABLE IF EXISTS p3_routes           CASCADE;
+DROP TABLE IF EXISTS p3_cargo            CASCADE;
+DROP TABLE IF EXISTS p3_ships            CASCADE;
+DROP TABLE IF EXISTS p3_player_buildings CASCADE;
+DROP TABLE IF EXISTS p3_building_types   CASCADE;
+DROP TABLE IF EXISTS p3_price_history    CASCADE;
+DROP TABLE IF EXISTS p3_market           CASCADE;
+DROP TABLE IF EXISTS p3_city_goods       CASCADE;
+DROP TABLE IF EXISTS p3_hex_tiles        CASCADE;
+DROP TABLE IF EXISTS p3_good_elasticity  CASCADE;
+DROP TABLE IF EXISTS p3_cities           CASCADE;
+DROP TABLE IF EXISTS p3_goods            CASCADE;
+DROP TABLE IF EXISTS p3_player           CASCADE;
+SQL
+    success "All Patrician objects dropped."
+}
+
 # ── Full setup ────────────────────────────────────────────────────────────
 p3_setup_all() {
+    p3_drop_tables
     p3_create_tables
     p3_seed_goods
     p3_seed_cities
