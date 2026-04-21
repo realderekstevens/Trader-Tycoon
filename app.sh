@@ -1920,7 +1920,7 @@ patrician_menu() {
     while true; do
         p3_main_dashboard
 
-        choice="$(gum choose \
+        choice="$(gum choose --height 40 \
             "── Setup ──" \
             "Initialise / Reset Game" \
             "Reseed Market Prices" \
