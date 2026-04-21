@@ -25,7 +25,7 @@
 #                "Advance One Day")    p3_advance_day
 #    4. Replace  "Give Sail Order" case body with a call to p3_sail_ship.
 #
-#  DEPENDENCIES: psql  gum  bc
+#  DEPENDENCIES: psql  gum
 # =============================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +68,53 @@ p3_pick_good() {
         | sed 's/^ *//' | grep -v '^$' \
         | gum filter --placeholder "Select good…"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STANDALONE HELPERS  (provided by app.sh when sourced; defined here for
+#  direct execution of patrician3.sh as a self-contained game)
+# ─────────────────────────────────────────────────────────────────────────────
+declare -a MENU_BREADCRUMB=("Main")
+
+push_breadcrumb() { MENU_BREADCRUMB+=("$1"); }
+pop_breadcrumb()  { [[ ${#MENU_BREADCRUMB[@]} -gt 1 ]] && unset 'MENU_BREADCRUMB[-1]'; }
+
+section_header() {
+    local crumb
+    crumb=$(IFS=" › "; echo "${MENU_BREADCRUMB[*]}")
+    gum style \
+        --border normal \
+        --margin "1" \
+        --padding "1 2" \
+        --border-foreground 008F11 \
+        --bold "$crumb › $1"
+}
+
+info()    { gum style --foreground 244 "info:  $*";     }
+success() { gum style --foreground 76  "✓ $*";          }
+error()   { gum style --foreground 196 "✗ $*" >&2;      }
+warn()    { gum style --foreground 214 "⚠ $*";          }
+
+pause() {
+    gum style --foreground 244 "Press ENTER to continue..."
+    read -r
+}
+
+confirm() {
+    gum confirm --default=false --timeout=30s -- "$1" || return 1
+}
+
+require() {
+    command -v "$1" &>/dev/null || {
+        echo "❌ Required command not found: $1" >&2
+        exit 1
+    }
+}
+
+# Dependency check (only when run standalone — sourcing app.sh does its own check)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    require gum
+    require psql
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  §14a  SCHEMA  (p3_create_tables)
@@ -290,6 +337,122 @@ CREATE TABLE IF NOT EXISTS p3_good_elasticity (
     price_floor_pct NUMERIC(5,3) NOT NULL DEFAULT 0.30,
     price_ceil_pct  NUMERIC(5,3) NOT NULL DEFAULT 3.00
 );
+
+-- ── Enhanced multi-factor marginal price function ────────────────────────
+--
+--  Factors applied on top of the base stock/elasticity power law:
+--    1. SEASONAL  — sine wave over the 360-day year, phase-shifted per
+--                   category (food cheap at harvest, luxury peaks year-end)
+--    2. PANIC     — extra spike when stock < 20 % of reference (hoarding
+--                   premium); symmetric glut discount above 200 %
+--    3. CATEGORY  — luxury goods are intrinsically more volatile than staples
+--    4. SPREAD    — ASK = midpoint × 1.08, BID = midpoint × 0.92
+--    5. CLAMP     — hard floor / ceiling from p3_good_elasticity
+--
+--  p_qty_offset = units already purchased this session (0 for first unit)
+--  so the function returns the *marginal* price of the next unit.
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION p3_marginal_price(
+    p_city_id    INT,
+    p_good_id    INT,
+    p_action     TEXT,      -- 'buy'  or  'sell'
+    p_qty_offset INT,       -- units already transacted this session
+    p_game_day   INT        -- 1..360  for seasonal shift
+) RETURNS NUMERIC LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_mid             NUMERIC;
+    v_stock           INT;
+    v_stock_ref       INT;
+    v_elast           NUMERIC;
+    v_floor_pct       NUMERIC;
+    v_ceil_pct        NUMERIC;
+    v_category        TEXT;
+    v_effective_stock INT;
+    v_season_mod      NUMERIC;
+    v_vol_mod         NUMERIC;
+    v_scarcity        NUMERIC;
+    v_panic_mod       NUMERIC;
+    v_price           NUMERIC;
+BEGIN
+    SELECT
+        (m.current_buy / 1.08 + m.current_sell / 0.92) / 2.0,
+        m.stock,
+        e.stock_ref,
+        g.category,
+        CASE WHEN p_action = 'buy' THEN e.elasticity_buy
+             ELSE e.elasticity_sell END,
+        e.price_floor_pct,
+        e.price_ceil_pct
+    INTO v_mid, v_stock, v_stock_ref, v_category, v_elast, v_floor_pct, v_ceil_pct
+    FROM p3_market m
+    JOIN p3_goods g           ON g.good_id = m.good_id
+    JOIN p3_good_elasticity e ON e.good_id = g.good_id
+    WHERE m.city_id = p_city_id AND m.good_id = p_good_id;
+
+    IF NOT FOUND THEN RETURN NULL; END IF;
+
+    -- Effective stock moves in opposite directions for buy vs sell
+    v_effective_stock := GREATEST(
+        CASE WHEN p_action = 'buy'
+             THEN v_stock - p_qty_offset
+             ELSE v_stock + p_qty_offset
+        END, 1
+    );
+
+    -- 1. Seasonal factor  (±10 % amplitude, 360-day period)
+    --    Phase offsets: food cheap mid-year (harvest), material peaks in
+    --    summer building season, luxury peaks at year-end celebrations.
+    v_season_mod := 1.0 + 0.10 * SIN(
+        (p_game_day::NUMERIC / 360.0) * 2.0 * PI()
+        + CASE v_category
+            WHEN 'food'     THEN PI()           -- trough at day 180
+            WHEN 'material' THEN PI() / 2.0     -- peak at day  90
+            WHEN 'luxury'   THEN -PI() / 2.0    -- peak at day 270
+            ELSE PI() / 4.0
+          END
+    );
+
+    -- 2. Category volatility multiplier
+    v_vol_mod := CASE v_category
+        WHEN 'luxury'    THEN 1.25   -- exotic goods swing the hardest
+        WHEN 'food'      THEN 0.88   -- staple prices are sticky
+        WHEN 'material'  THEN 1.05
+        ELSE 1.0
+    END;
+
+    -- 3. Core power-law scarcity
+    v_scarcity := POWER(
+        v_stock_ref::NUMERIC / v_effective_stock::NUMERIC,
+        v_elast
+    );
+
+    -- 4. Panic / glut non-linearity
+    --    Below 20 % of reference: price spikes steeply (panic buying premium)
+    --    Above 200 % of reference: price further depressed  (glut discount)
+    v_panic_mod := CASE
+        WHEN v_effective_stock < v_stock_ref * 0.20 THEN
+            1.0 + 0.60 * (1.0 - v_effective_stock::NUMERIC
+                               / (v_stock_ref::NUMERIC * 0.20))
+        WHEN v_effective_stock > v_stock_ref * 2.0 THEN
+            1.0 - 0.20 * LEAST(
+                (v_effective_stock::NUMERIC / (v_stock_ref::NUMERIC * 2.0)) - 1.0,
+                1.0)
+        ELSE 1.0
+    END;
+
+    v_price := v_mid * v_season_mod * v_vol_mod * v_scarcity * v_panic_mod;
+
+    -- 5. Bid/Ask spread
+    IF p_action = 'buy'  THEN v_price := v_price * 1.08; END IF;
+    IF p_action = 'sell' THEN v_price := v_price * 0.92; END IF;
+
+    -- 6. Hard floor / ceiling
+    RETURN GREATEST(
+        v_mid * v_floor_pct,
+        LEAST(v_mid * v_ceil_pct, ROUND(v_price, 2))
+    );
+END;
+$$;
 
 -- ── Limit orders ──────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS p3_limit_orders (
@@ -1206,13 +1369,13 @@ p3_do_buy() {
         IF v_stock < $qty THEN RAISE EXCEPTION 'Not enough stock (have %, need %)',v_stock,$qty; END IF;
         IF v_free  < $qty THEN RAISE EXCEPTION 'Not enough cargo (free %, need %)',v_free,$qty; END IF;
 
-        -- Per-unit marginal cost loop
+        -- Per-unit marginal cost loop — uses enhanced multi-factor pricing:
+        --   seasonal shift + category volatility + panic/glut non-linearity
         v_total := 0;
         FOR i IN 0..($qty-1) LOOP
-            unit_price := ROUND(v_mid * POWER(v_stock_ref::NUMERIC/GREATEST(v_stock-i,1)::NUMERIC,v_elast)*1.08, 2);
-            unit_price := GREATEST(unit_price, ref_mid * v_floor_pct);
-            unit_price := LEAST   (unit_price, ref_mid * v_ceil_pct);
-            v_total := v_total + unit_price;
+            unit_price := p3_marginal_price(v_cid, v_gid, 'buy', i,
+                              (SELECT game_day FROM p3_player LIMIT 1));
+            v_total := v_total + COALESCE(unit_price, 0);
         END LOOP;
         v_avg := ROUND(v_total/$qty, 2);
 
@@ -1223,8 +1386,12 @@ p3_do_buy() {
         INSERT INTO p3_cargo (ship_id,good_id,quantity) VALUES ($sid,v_gid,$qty)
             ON CONFLICT (ship_id,good_id) DO UPDATE SET quantity=p3_cargo.quantity+EXCLUDED.quantity;
 
-        new_mid := ROUND(v_mid*POWER(v_stock_ref::NUMERIC/GREATEST(v_stock-$qty,1)::NUMERIC,v_elast),2);
-        new_mid := GREATEST(LEAST(new_mid, ref_mid*v_ceil_pct), ref_mid*v_floor_pct);
+        -- Post-trade mid uses the enhanced function at the new stock level
+        new_mid := COALESCE(
+            p3_marginal_price(v_cid, v_gid, 'buy', $qty,
+                (SELECT game_day FROM p3_player LIMIT 1)) / 1.08,
+            ROUND(v_mid*POWER(v_stock_ref::NUMERIC/GREATEST(v_stock-$qty,1)::NUMERIC,v_elast),2)
+        );
 
         UPDATE p3_market SET stock=stock-$qty,
             current_buy=GREATEST(1,ROUND(new_mid*1.08,2)),
@@ -1277,21 +1444,24 @@ p3_do_sell() {
             RAISE EXCEPTION 'Not enough cargo (have %, need %)',COALESCE(v_aboard,0),$qty;
         END IF;
 
-        -- Per-unit marginal revenue loop (each unit floods market further)
+        -- Per-unit marginal revenue loop — same multi-factor model, sell side
         v_total := 0;
         FOR i IN 0..($qty-1) LOOP
-            unit_price := ROUND(v_mid*POWER(v_stock_ref::NUMERIC/GREATEST(v_stock+i+1,1)::NUMERIC,v_elast)*0.92, 2);
-            unit_price := GREATEST(unit_price, ref_mid*v_floor_pct);
-            unit_price := LEAST   (unit_price, ref_mid*v_ceil_pct);
-            v_total := v_total + unit_price;
+            unit_price := p3_marginal_price(v_cid, v_gid, 'sell', i,
+                              (SELECT game_day FROM p3_player LIMIT 1));
+            v_total := v_total + COALESCE(unit_price, 0);
         END LOOP;
         v_avg := ROUND(v_total/$qty, 2);
 
         UPDATE p3_cargo SET quantity=quantity-$qty WHERE ship_id=$sid AND good_id=v_gid;
         DELETE FROM p3_cargo WHERE ship_id=$sid AND good_id=v_gid AND quantity<=0;
 
-        new_mid := ROUND(v_mid*POWER(v_stock_ref::NUMERIC/GREATEST(v_stock+$qty,1)::NUMERIC,v_elast),2);
-        new_mid := GREATEST(LEAST(new_mid,ref_mid*v_ceil_pct),ref_mid*v_floor_pct);
+        -- Post-trade mid uses the enhanced function at the new (higher) stock level
+        new_mid := COALESCE(
+            p3_marginal_price(v_cid, v_gid, 'sell', $qty,
+                (SELECT game_day FROM p3_player LIMIT 1)) / 0.92,
+            ROUND(v_mid*POWER(v_stock_ref::NUMERIC/GREATEST(v_stock+$qty,1)::NUMERIC,v_elast),2)
+        );
 
         UPDATE p3_market SET stock=stock+$qty,
             current_buy=GREATEST(1,ROUND(new_mid*1.08,2)),
@@ -1432,7 +1602,7 @@ patrician_menu() {
                     *) pause; continue ;;
                 esac
                 local gold; gold=$(p3_gold)
-                if (( $(echo "$gold < $cost" | bc -l) )); then
+                if awk "BEGIN{exit !(${gold}+0 < ${cost}+0)}"; then
                     error "Not enough gold (have ${gold}g, need ${cost}g)."
                 else
                     local sname home
@@ -1603,7 +1773,7 @@ patrician_menu() {
                 info "Select city A:"; ca=$(p3_pick_city); [[ -z "$ca" ]] && { pause; continue; }
                 info "Select city B:"; cb=$(p3_pick_city); [[ -z "$cb" ]] && { pause; continue; }
                 dist=$(gum input --placeholder "Distance in nautical miles" --value "300")
-                local tdays; tdays=$(echo "scale=0; $dist / 120" | bc)
+                local tdays; tdays=$(awk "BEGIN{printf \"%d\", int(${dist}/120 + 0.5)}")
                 [[ -z "$tdays" || "$tdays" == "0" ]] && tdays=3
                 p3_psql -c "
                     INSERT INTO p3_routes (name,city_a,city_b,distance_nm,travel_days)
@@ -1875,7 +2045,7 @@ p3_buildings_menu() {
                 bt_cost=$(p3_psql --tuples-only -c "SELECT construction_cost FROM p3_building_types WHERE building_type_id=$bt_id;" | tr -d ' ')
 
                 local gold_now; gold_now=$(p3_gold)
-                if (( $(echo "$gold_now < $bt_cost" | bc -l) )); then
+                if awk "BEGIN{exit !(${gold_now}+0 < ${bt_cost}+0)}"; then
                     error "Not enough gold (have ${gold_now}g, need ${bt_cost}g)."
                     pause; continue
                 fi
@@ -1963,7 +2133,7 @@ p3_buildings_menu() {
                     WHERE pb.pb_id=$pb_id;" | tr -d ' ')
                 local total_cost=$(( cost_each * add_n ))
                 local gold_now; gold_now=$(p3_gold)
-                if (( $(echo "$gold_now < $total_cost" | bc -l) )); then
+                if awk "BEGIN{exit !(${gold_now}+0 < ${total_cost}+0)}"; then
                     error "Need ${total_cost}g, have ${gold_now}g."
                     pause; continue
                 fi
@@ -2116,3 +2286,179 @@ p3_elasticity_menu() {
         pause
     done
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14k  HEX MAP MENU  (ported from app.sh; uses p3_travel_days not months)
+# ─────────────────────────────────────────────────────────────────────────────
+p3_hex_menu() {
+    push_breadcrumb "🗺 Hex Map"
+    while true; do
+        section_header "🗺 Hex Map & World"
+
+        choice="$(gum choose \
+            "── Overview ──" \
+            "Show All City Positions" \
+            "ASCII Map (text overview)" \
+            "── Distance & Travel ──" \
+            "Distance Between Two Cities" \
+            "Cities Within Range of City" \
+            "Travel Time Between Cities" \
+            "── Hex Tile Operations ──" \
+            "View Tile at Coordinates" \
+            "List All Placed Tiles" \
+            "Create / Edit Tile" \
+            "Move City to New Hex" \
+            "Back")"
+
+        case "$choice" in
+            "── Overview ──"|"── Distance & Travel ──"|"── Hex Tile Operations ──")
+                continue ;;
+
+            "Show All City Positions")
+                p3_psql -c "
+                    SELECT ci.name AS city, ci.region, ci.league,
+                           ci.hex_q AS q, ci.hex_r AS r,
+                           (-ci.hex_q - ci.hex_r) AS s,
+                           COALESCE(ht.terrain,'unmapped') AS terrain,
+                           ci.population
+                    FROM p3_cities ci
+                    LEFT JOIN p3_hex_tiles ht ON ht.city_id = ci.city_id
+                    ORDER BY ci.league, ci.name;" ;;
+
+            "ASCII Map (text overview)")
+                gum style --foreground 244 \
+                    "Flat-top hex map  |  Each hex ≈ 50 nm  |  W←q→E  N←r→S"
+                echo
+                p3_psql -c "
+                    SELECT
+                        LPAD(ci.hex_q::text,4) || ',' ||
+                        LPAD(ci.hex_r::text,4) || '  ' ||
+                        RPAD(LEFT(ci.name,18),18) ||
+                        '  hexes_from_Lubeck: ' ||
+                        COALESCE(p3_hex_distance(0,0,ci.hex_q,ci.hex_r)::text,'?')
+                    FROM p3_cities ci
+                    WHERE ci.hex_q IS NOT NULL
+                    ORDER BY ci.hex_r, ci.hex_q;" | cat
+                echo
+                gum style --foreground 244 \
+                    "Snaikka (5 kn): ~120 nm/day ≈ 2.4 hex/day." ;;
+
+            "Distance Between Two Cities")
+                info "Select first city:"; local ca; ca=$(p3_pick_city)
+                [[ -z "$ca" ]] && { pause; continue; }
+                info "Select second city:"; local cb; cb=$(p3_pick_city)
+                [[ -z "$cb" ]] && { pause; continue; }
+                p3_psql -c "
+                    SELECT ca.name AS from_city, cb.name AS to_city,
+                           COALESCE(p3_hex_distance(ca.hex_q,ca.hex_r,cb.hex_q,cb.hex_r)::text,'?') AS hex_dist,
+                           COALESCE((p3_hex_distance(ca.hex_q,ca.hex_r,cb.hex_q,cb.hex_r)*50)::text,'?') AS approx_nm,
+                           COALESCE(p3_travel_days(ca.city_id,cb.city_id,5.0)::text,'no coords') AS days_snaikka_5kn,
+                           COALESCE(p3_travel_days(ca.city_id,cb.city_id,7.0)::text,'—')         AS days_crayer_7kn,
+                           COALESCE(p3_travel_days(ca.city_id,cb.city_id,9.0)::text,'—')         AS days_galley_9kn
+                    FROM p3_cities ca, p3_cities cb
+                    WHERE ca.name='$ca' AND cb.name='$cb';" ;;
+
+            "Cities Within Range of City")
+                local src_city max_days
+                src_city=$(p3_pick_city); [[ -z "$src_city" ]] && { pause; continue; }
+                max_days=$(gum input --placeholder "Max travel days (e.g. 7)" --value "7")
+                [[ -z "$max_days" ]] && { pause; continue; }
+                p3_psql -c "
+                    SELECT dest.name AS city,
+                           COALESCE(p3_hex_distance(src.hex_q,src.hex_r,dest.hex_q,dest.hex_r)::text,'?') AS hexes,
+                           COALESCE((p3_hex_distance(src.hex_q,src.hex_r,dest.hex_q,dest.hex_r)*50)::text,'?') AS nm,
+                           COALESCE(p3_travel_days(src.city_id,dest.city_id,5.0)::text,'?') AS days_snaikka
+                    FROM p3_cities src, p3_cities dest
+                    WHERE src.name = '$src_city'
+                      AND dest.city_id <> src.city_id
+                      AND dest.hex_q IS NOT NULL AND src.hex_q IS NOT NULL
+                      AND COALESCE(p3_travel_days(src.city_id,dest.city_id,5.0), 9999) <= $max_days
+                    ORDER BY p3_travel_days(src.city_id,dest.city_id,5.0), dest.name;" ;;
+
+            "Travel Time Between Cities")
+                info "Snaikka 5kn · Crayer 7kn · Hulk 4kn · Cog 6kn · Galley 9kn · Carrack 5.5kn"
+                info "Select origin:";      local ta; ta=$(p3_pick_city); [[ -z "$ta" ]] && { pause; continue; }
+                info "Select destination:"; local tb; tb=$(p3_pick_city); [[ -z "$tb" ]] && { pause; continue; }
+                p3_psql -c "
+                    SELECT ca.name AS origin, cb.name AS destination,
+                           COALESCE(p3_hex_distance(ca.hex_q,ca.hex_r,cb.hex_q,cb.hex_r)::text,'?') AS hex_dist,
+                           COALESCE(p3_travel_days(ca.city_id,cb.city_id,5.0)::text,'?')   AS snaikka_5kn,
+                           COALESCE(p3_travel_days(ca.city_id,cb.city_id,7.0)::text,'?')   AS crayer_7kn,
+                           COALESCE(p3_travel_days(ca.city_id,cb.city_id,9.0)::text,'?')   AS galley_9kn,
+                           COALESCE(p3_travel_days(ca.city_id,cb.city_id,5.5)::text,'?')   AS carrack_5_5kn
+                    FROM p3_cities ca, p3_cities cb
+                    WHERE ca.name='$ta' AND cb.name='$tb';" ;;
+
+            "View Tile at Coordinates")
+                local tq; tq=$(gum input --placeholder "q" --value "0")
+                local tr; tr=$(gum input --placeholder "r" --value "0")
+                p3_psql -c "
+                    SELECT ht.q, ht.r, ht.s, ht.terrain,
+                           COALESCE(ci.name,'(no city)') AS city,
+                           COALESCE(ht.hazard,'none') AS hazard, ht.notes
+                    FROM p3_hex_tiles ht
+                    LEFT JOIN p3_cities ci ON ci.city_id = ht.city_id
+                    WHERE ht.q=$tq AND ht.r=$tr;" ;;
+
+            "List All Placed Tiles")
+                p3_psql -c "
+                    SELECT ht.q, ht.r, ht.s, ht.terrain,
+                           COALESCE(ci.name,'—') AS city,
+                           COALESCE(ht.hazard,'—') AS hazard
+                    FROM p3_hex_tiles ht
+                    LEFT JOIN p3_cities ci ON ci.city_id = ht.city_id
+                    ORDER BY ht.r, ht.q;" ;;
+
+            "Create / Edit Tile")
+                local tq tr terrain hazard tnotes
+                tq=$(gum input --placeholder "q coordinate")
+                tr=$(gum input --placeholder "r coordinate")
+                [[ -z "$tq" || -z "$tr" ]] && { pause; continue; }
+                terrain=$(gum choose "sea" "coast" "land" "forest" "mountain" "ice")
+                hazard=$(gum input --placeholder "Hazard (blank = none)")
+                tnotes=$(gum input --placeholder "Notes  (blank = none)")
+                p3_psql -c "
+                    INSERT INTO p3_hex_tiles (q,r,terrain,hazard,notes)
+                    VALUES ($tq,$tr,'$terrain',
+                            NULLIF('$hazard',''), NULLIF('$tnotes',''))
+                    ON CONFLICT (q,r) DO UPDATE
+                        SET terrain=EXCLUDED.terrain,
+                            hazard=EXCLUDED.hazard,
+                            notes=EXCLUDED.notes;" >/dev/null
+                success "Tile ($tq,$tr) saved as $terrain." ;;
+
+            "Move City to New Hex")
+                local city nq nr
+                city=$(p3_pick_city); [[ -z "$city" ]] && { pause; continue; }
+                nq=$(gum input --placeholder "New q coordinate")
+                nr=$(gum input --placeholder "New r coordinate")
+                [[ -z "$nq" || -z "$nr" ]] && { pause; continue; }
+                p3_psql -c "UPDATE p3_cities SET hex_q=$nq, hex_r=$nr WHERE name='$city';" >/dev/null
+                success "$city moved to hex ($nq,$nr)." ;;
+
+            "Back" | *) pop_breadcrumb; return ;;
+        esac
+        pause
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14l  ENTRY POINT — run standalone as ./patrician3.sh
+# ─────────────────────────────────────────────────────────────────────────────
+run_app() {
+    clear
+    gum style \
+        --border double \
+        --margin "1" \
+        --padding "1 4" \
+        --border-foreground 33 \
+        --bold \
+        "⚓  PATRICIAN III / IV" \
+        "$(gum style --foreground 244 'Hanseatic Trading Simulation — CLI Edition')"
+    patrician_menu
+}
+
+# Only auto-run when executed directly (not when sourced into app.sh)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    run_app
+fi
