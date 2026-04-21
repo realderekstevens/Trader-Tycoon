@@ -603,6 +603,29 @@ JOIN   p3_market_view sm
 WHERE  sm.current_sell > bm.current_buy
 ORDER  BY profit_per_unit DESC;
 
+-- ── pg_notify helper ─────────────────────────────────────────────────────
+--
+--  Called by the bash tick daemon every simulated game day.
+--  Any external psql session can receive real-time events with:
+--    LISTEN p3_day_tick;
+--
+--  Payload JSON: { "year": N, "day": N, "gold": N.NN, "rank": "..." }
+--
+CREATE OR REPLACE FUNCTION p3_notify_tick()
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_payload TEXT;
+BEGIN
+    SELECT json_build_object(
+        'year', game_year,
+        'day',  game_day,
+        'gold', ROUND(gold, 2),
+        'rank', rank
+    )::text INTO v_payload FROM p3_player LIMIT 1;
+    PERFORM pg_notify('p3_day_tick', COALESCE(v_payload, '{}'));
+END;
+$$;
+
 SQL
     success "✅  All Patrician III + IV tables and views created."
 }
@@ -1648,18 +1671,254 @@ p3_do_sell() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  §14m  REAL-TIME TICK DAEMON  (pg_notify + LISTEN integration)
+#
+#  Architecture:
+#    _p3_tick_loop   — background bash loop; advances one game day every
+#                      P3_TICK_INTERVAL seconds, then calls p3_notify_tick()
+#                      which fires pg_notify('p3_day_tick', json_payload).
+#    _p3_listen_loop — background psql LISTEN session; writes the JSON
+#                      payload of each notification to P3_TICK_STATE_FILE
+#                      so the dashboard can show the last-tick info without
+#                      an extra DB round-trip.
+#
+#  External monitoring:  psql -c "LISTEN p3_day_tick;"
+#                        (receives live JSON every simulated day)
+# ─────────────────────────────────────────────────────────────────────────────
+P3_TICK_PID_FILE="/tmp/p3_tick_${P3_DB:-traderdude}.pid"
+P3_LISTEN_PID_FILE="/tmp/p3_listen_${P3_DB:-traderdude}.pid"
+P3_TICK_STATE_FILE="/tmp/p3_tick_${P3_DB:-traderdude}.state"
+P3_TICK_INTERVAL="${P3_TICK_INTERVAL:-10}"    # seconds per simulated game day
+
+# ── Internal: background loop that advances the day ──────────────────────
+_p3_tick_loop() {
+    while true; do
+        sleep "${P3_TICK_INTERVAL:-10}"
+        # Advance ships, production, prices, calendar — then notify
+        p3_psql <<'TKSQL' >/dev/null 2>&1 || true
+-- Ship movement
+UPDATE p3_ships SET eta_days = eta_days - 1
+    WHERE status = 'sailing' AND eta_days > 0;
+UPDATE p3_ships
+    SET status = 'docked', current_city = destination, destination = NULL, eta_days = 0
+    WHERE status = 'sailing' AND eta_days <= 0;
+-- Daily stock tick
+UPDATE p3_market m SET stock = LEAST(500, GREATEST(0,
+    m.stock
+    + COALESCE((SELECT FLOOR(g.base_production * cg.efficiency / 100.0)::INTEGER
+                FROM p3_city_goods cg JOIN p3_goods g ON g.good_id = cg.good_id
+                WHERE cg.city_id = m.city_id AND cg.good_id = m.good_id
+                  AND cg.role = 'produces'), 0)
+    - GREATEST(1, ROUND((m.stock * 0.0017)::NUMERIC, 0)::INTEGER)))
+WHERE m.stock > 0 OR EXISTS (
+    SELECT 1 FROM p3_city_goods cg
+    WHERE cg.city_id = m.city_id AND cg.good_id = m.good_id AND cg.role = 'produces');
+-- Daily price tick
+UPDATE p3_market m
+    SET current_sell = GREATEST(1, ROUND(e.new_mid * 0.92, 2)),
+        current_buy  = GREATEST(1, ROUND(e.new_mid * 1.08, 2))
+    FROM (SELECT m2.city_id, m2.good_id,
+                 ROUND(((m2.current_buy / 1.08 + m2.current_sell / 0.92) / 2.0)
+                 * CASE WHEN m2.stock <  20  THEN 1.0027
+                        WHEN m2.stock <  50  THEN 1.0010
+                        WHEN m2.stock > 350  THEN 0.9977
+                        WHEN m2.stock > 200  THEN 0.9990 ELSE 1.0 END
+                 * (0.9987 + RANDOM() * 0.0026), 2) AS new_mid
+          FROM p3_market m2) e
+    WHERE e.city_id = m.city_id AND e.good_id = m.good_id;
+-- Advance calendar
+UPDATE p3_player
+    SET game_day  = CASE WHEN game_day >= 360 THEN 1      ELSE game_day + 1  END,
+        game_year = CASE WHEN game_day >= 360 THEN game_year + 1 ELSE game_year END;
+-- Fire pg_notify so any LISTEN client gets the event
+SELECT p3_notify_tick();
+TKSQL
+        # Write last-tick state to file for dashboard (avoids an extra query)
+        p3_psql --tuples-only -c "
+            SELECT json_build_object(
+                'year', game_year, 'day', game_day, 'gold', ROUND(gold, 2)
+            )::text FROM p3_player LIMIT 1;" 2>/dev/null \
+            | tr -d ' \n' > "$P3_TICK_STATE_FILE" || true
+    done
+}
+
+# ── Internal: psql LISTEN session — writes each notification to state file
+_p3_listen_loop() {
+    # pg_sleep(86400) keeps the connection open for up to 24 h; psql prints
+    # async notifications as they arrive on stdout, which we parse here.
+    printf 'LISTEN p3_day_tick;\nSELECT pg_sleep(86400);\n' \
+        | psql -X --username="$P3_USER" --dbname="$P3_DB" --no-readline 2>/dev/null \
+        | while IFS= read -r line; do
+              if [[ "$line" == *'p3_day_tick'* ]]; then
+                  local payload
+                  payload=$(grep -oE '\{[^}]+\}' <<< "$line" || true)
+                  [[ -n "$payload" ]] && printf '%s' "$payload" > "$P3_TICK_STATE_FILE"
+              fi
+          done
+}
+
+p3_start_tick() {
+    if [[ -f "$P3_TICK_PID_FILE" ]] && kill -0 "$(cat "$P3_TICK_PID_FILE")" 2>/dev/null; then
+        warn "Tick daemon already running  (PID $(cat "$P3_TICK_PID_FILE"))."
+        return
+    fi
+    _p3_tick_loop &
+    echo $! > "$P3_TICK_PID_FILE"
+    _p3_listen_loop &
+    echo $! > "$P3_LISTEN_PID_FILE"
+    success "⏱  Auto-tick STARTED — 1 game day every ${P3_TICK_INTERVAL}s"
+    info    "   Tick PID   : $(cat "$P3_TICK_PID_FILE")"
+    info    "   pg_notify  : channel p3_day_tick  (payload = JSON)"
+    info    "   External   : psql -c \"LISTEN p3_day_tick;\""
+}
+
+p3_stop_tick() {
+    local stopped=0
+    for pidfile in "$P3_TICK_PID_FILE" "$P3_LISTEN_PID_FILE"; do
+        if [[ -f "$pidfile" ]]; then
+            kill "$(cat "$pidfile")" 2>/dev/null || true
+            rm -f "$pidfile"
+            (( stopped++ )) || true
+        fi
+    done
+    [[ $stopped -gt 0 ]] && success "⏹  Tick daemon stopped." \
+                         || warn    "No tick daemon is running."
+}
+
+p3_tick_status() {
+    echo
+    if [[ -f "$P3_TICK_PID_FILE" ]] && kill -0 "$(cat "$P3_TICK_PID_FILE")" 2>/dev/null; then
+        success "⏱  RUNNING — 1 game day every ${P3_TICK_INTERVAL}s  (PID $(cat "$P3_TICK_PID_FILE"))"
+        if [[ -f "$P3_TICK_STATE_FILE" ]]; then
+            info "   Last tick state : $(cat "$P3_TICK_STATE_FILE")"
+        fi
+        info    "   pg_notify channel : p3_day_tick"
+        info    "   LISTEN externally : psql -U ${P3_USER} ${P3_DB} -c 'LISTEN p3_day_tick;'"
+    else
+        rm -f "$P3_TICK_PID_FILE" "$P3_LISTEN_PID_FILE" 2>/dev/null || true
+        warn "⏹  Stopped — use 'Start Auto-Tick' from the Simulation menu to begin."
+    fi
+}
+
+p3_set_tick_interval() {
+    local v
+    v=$(gum input --placeholder "Seconds per game day (current: ${P3_TICK_INTERVAL})" \
+                  --value "$P3_TICK_INTERVAL")
+    [[ "$v" =~ ^[1-9][0-9]*$ ]] || { error "Enter a positive whole number."; return; }
+    P3_TICK_INTERVAL="$v"
+    success "Tick interval set to ${P3_TICK_INTERVAL}s/day."
+    if [[ -f "$P3_TICK_PID_FILE" ]] && kill -0 "$(cat "$P3_TICK_PID_FILE")" 2>/dev/null; then
+        if confirm "Restart daemon now to apply the new interval?"; then
+            p3_stop_tick
+            p3_start_tick
+        fi
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14n  RICH MAIN DASHBOARD
+#
+#  Displayed at the top of every patrician_menu iteration.
+#  Uses full terminal width: left panel = status + fleet,
+#  right panel = live arbitrage opportunities.
+# ─────────────────────────────────────────────────────────────────────────────
+p3_main_dashboard() {
+    local cols half ruler
+    cols=$(tput cols 2>/dev/null || echo 90)
+    half=$(( cols / 2 - 2 ))
+    [[ $half -lt 36 ]] && half=36
+    [[ $half -gt 64 ]] && half=64
+    ruler=$(printf '─%.0s' $(seq 1 $((half - 4))))
+
+    # ── Single DB round-trip: player + fleet counts ──────────────────────────
+    local gold rank gyear gday docked sailing
+    {
+        read -r gold; read -r rank; read -r gyear
+        read -r gday; read -r docked; read -r sailing
+    } < <(p3_psql --tuples-only -c "
+        SELECT pl.gold::text, pl.rank,
+               pl.game_year::text, pl.game_day::text,
+               (SELECT COUNT(*)::text FROM p3_ships WHERE owner='player' AND status='docked'),
+               (SELECT COUNT(*)::text FROM p3_ships WHERE owner='player' AND status='sailing')
+        FROM p3_player pl LIMIT 1;" 2>/dev/null \
+        | sed 's/|/\n/g; s/^ *//; s/ *$//' \
+        || printf '???\nApprentice\n???\n0\n0\n0\n')
+
+    # ── Fleet detail lines ───────────────────────────────────────────────────
+    local fleet_lines
+    fleet_lines=$(p3_psql --tuples-only -c "
+        SELECT '  ' || RPAD(name, 14) ||
+               CASE status
+                   WHEN 'sailing' THEN '⛵ → ' || COALESCE(destination,'?') ||
+                                       '  ETA ' || eta_days || 'd'
+                   ELSE           '⚓ ' || current_city
+               END || '  [' || cargo_used || '/' || cargo_cap || ']'
+        FROM p3_fleet_view ORDER BY status DESC, name LIMIT 6;" 2>/dev/null \
+        | grep -v '^\s*$' || echo "  (no ships in fleet)")
+
+    # ── Tick badge ───────────────────────────────────────────────────────────
+    local tick_badge
+    if [[ -f "$P3_TICK_PID_FILE" ]] && kill -0 "$(cat "$P3_TICK_PID_FILE")" 2>/dev/null; then
+        tick_badge="⏱  Auto-tick RUNNING   ${P3_TICK_INTERVAL}s / day"
+    else
+        tick_badge="⏹  Manual mode  ·  Simulation › Start Auto-Tick"
+    fi
+
+    # ── Arbitrage opportunities ──────────────────────────────────────────────
+    local arb_lines
+    arb_lines=$(p3_psql --tuples-only -c "
+        SELECT '  ' || RPAD(good, 12)    ||
+                       RPAD(buy_city, 14) ||
+               '→  '|| RPAD(sell_city, 14) ||
+               '+' || profit_per_unit || '/u'
+        FROM p3_arbitrage_view LIMIT 7;" 2>/dev/null \
+        | grep -v '^\s*$' || echo "  (run Initialise / Reset Game first)")
+
+    # ── Render left panel: status + fleet ────────────────────────────────────
+    local panel_left
+    panel_left=$(
+    {
+        printf '⚓  PATRICIAN  III / IV\n'
+        printf '%s\n' "$ruler"
+        printf '📅  Year %-6s  ·  Day %03d\n' "${gyear:-???}" "${gday:-0}"
+        printf '💰  %-22s  🏅  %s\n' "${gold:-???} gold" "${rank:-Apprentice}"
+        printf '%s\n' "$ruler"
+        printf '🚢  %s docked   ·   %s at sea\n' "${docked:-0}" "${sailing:-0}"
+        printf '%s\n' "$fleet_lines"
+        printf '%s\n' "$ruler"
+        printf '%s\n' "$tick_badge"
+    } | gum style \
+            --border rounded \
+            --border-foreground 33 \
+            --padding "0 2" \
+            --width "$half")
+
+    # ── Render right panel: arbitrage ────────────────────────────────────────
+    local panel_right
+    panel_right=$(
+    {
+        printf '📊  ARBITRAGE OPPORTUNITIES\n'
+        printf '%s\n' "$ruler"
+        printf '  %-12s %-14s %-14s %s\n' "GOOD" "BUY AT" "SELL AT" "PROFIT"
+        printf '%s\n' "$ruler"
+        printf '%s\n' "$arb_lines"
+    } | gum style \
+            --border rounded \
+            --border-foreground 214 \
+            --padding "0 2" \
+            --width "$half")
+
+    gum join --horizontal --align top "$panel_left" "  " "$panel_right"
+    echo
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  §14g  MAIN PATRICIAN MENU
 # ─────────────────────────────────────────────────────────────────────────────
 patrician_menu() {
     push_breadcrumb "⚓ Patrician"
     while true; do
-        local gold yd
-        gold=$(p3_gold 2>/dev/null || echo "?")
-        yd=$(p3_psql --tuples-only -c \
-            "SELECT 'Year '||game_year||'  Day '||LPAD(game_day::text,3,'0') FROM p3_player;" \
-            2>/dev/null | tr -d ' ' || echo "??")
-
-        section_header "⚓ Patrician  │  💰 ${gold} gold  │  📅 ${yd}"
+        p3_main_dashboard
 
         choice="$(gum choose \
             "── Setup ──" \
@@ -1695,6 +1954,11 @@ patrician_menu() {
             "── Time ──" \
             "Advance One Day" \
             "Advance Multiple Days" \
+            "── Simulation ──" \
+            "Start Auto-Tick" \
+            "Stop Auto-Tick" \
+            "Tick Status" \
+            "Set Tick Interval" \
             "── Log ──" \
             "View Trade Log" \
             "── Mediterranean ──" \
@@ -1704,13 +1968,19 @@ patrician_menu() {
         case "$choice" in
             "── Setup ──"|"── Fleet ──"|"── Trading ──"|"── Buildings ──"|\
             "── Market ──"|"── Routes ──"|"── World ──"|"── Time ──"|\
-            "── Log ──"|"── Mediterranean ──")
+            "── Simulation ──"|"── Log ──"|"── Mediterranean ──")
                 continue ;;
 
             "🗺 Hex Map & City Distances")      p3_hex_menu ;;
             "📊 Market Elasticity & Price Curves") p3_elasticity_menu ;;
             "🏭 Manage Buildings & Limit Orders")  p3_buildings_menu ;;
             "🌊 Patrician IV — Mediterranean")     p3_p4_menu ;;
+
+            # ── SIMULATION ─────────────────────────────────────────────────
+            "Start Auto-Tick")    p3_start_tick ;;
+            "Stop Auto-Tick")     p3_stop_tick  ;;
+            "Tick Status")        p3_tick_status ;;
+            "Set Tick Interval")  p3_set_tick_interval ;;
 
             # ── SETUP ──────────────────────────────────────────────────────
             "Initialise / Reset Game")
