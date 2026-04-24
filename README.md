@@ -6,7 +6,6 @@
 > Build a merchant empire across the Hanseatic League and Mediterranean trade network.
 > Play as a Lübeck merchant, build a fleet, establish counting houses, and dominate Baltic trade.
 
-[![Flutter](https://img.shields.io/badge/Flutter-3.x-blue.svg)](https://flutter.dev)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14+-336791.svg)](https://postgresql.org)
 [![Shell](https://img.shields.io/badge/Shell-bash-green.svg)]()
 
@@ -17,8 +16,7 @@
 Patrician III/IV simulates the economics of the medieval Hanseatic League across **34 cities**
 (24 Baltic + 10 Mediterranean), **28 goods**, and a fully dynamic market model with per-unit
 marginal pricing, seasonal price swings, panic/glut mechanics, and a live auto-tick simulation
-engine. A Flutter frontend provides a cross-platform UI; the CLI edition runs entirely in bash
-with a PostgreSQL backend.
+engine. The CLI edition runs entirely in bash with a PostgreSQL backend.
 
 ### Key Features
 
@@ -30,7 +28,7 @@ with a PostgreSQL backend.
 - **Fog of war** — players only see market prices in cities where they have ships or counting houses
 - **Admin / player roles** — arbitrage data and global market views are admin-only
 - **Patrician IV expansion** — Mediterranean cities, goods (Silk, Ivory, Glass…), and ships
-- **Real-time simulation** — `pg_notify` tick daemon; Flutter UI updates live via WebSocket
+- **Real-time simulation** — `pg_notify` tick daemon
 
 ---
 
@@ -40,12 +38,6 @@ with a PostgreSQL backend.
 patrician3/
 ├── app.sh                  # Main CLI entry point (sources patrician3.sh)
 ├── patrician3.sh           # Core game engine — schema, seed, menus, tick daemon
-├── patrician3_app/         # Flutter cross-platform frontend
-│   ├── lib/
-│   │   ├── main.dart           # App root, navigation, PostgREST client
-│   │   └── hex_map_screen.dart # Interactive hex map widget
-│   ├── pubspec.yaml
-│   └── setup.sh            # One-time Flutter project wiring script
 ├── sql/
 │   ├── schema.sql          # Standalone schema (mirrors patrician3.sh §14a)
 │   ├── seed.sql            # Standalone seed data
@@ -67,9 +59,8 @@ patrician3/
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| PostgreSQL | 14+ | `generated columns` required for `p3_hex_tiles.s` |
+| PostgreSQL | 14+
 | [gum](https://github.com/charmbracelet/gum) | any | TUI prompts (`yay -S gum` for Arch Linux) |
-| Flutter SDK | 3.x | For the Flutter frontend |
 
 ### CLI Edition
 
@@ -86,27 +77,8 @@ export PSQL_USER=postgres
 
 # 3. In the game: Setup → Initialise / Reset Game → confirm
 #    Then: Simulation → Start Auto-Tick to begin the live economy
-#    Or keep it as turn-based if you're more into strategy
+#    Or keep it as turn-based if you're more into turn-based strategy
 ```
-
-### Flutter Frontend ### UNDER CONSTRUCTION ###
-
-```bash
-cd patrician3_app
-
-# One-time wiring (run after flutter create . or first clone)
-chmod +x setup.sh
-./bash setup.sh
-
-# Start a PostgREST server pointing at your PostgreSQL database, then:
-flutter run -d linux       # Linux desktop
-flutter run -d android     # Android
-flutter run -d chrome      # Web (requires Flutter web support)
-
-# First launch: open CONFIG tab, set PostgREST URL (default: http://localhost:3000)
-```
-
----
 
 ## 🎮 Gameplay
 
@@ -268,15 +240,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Pull requests welcome for:
 
 - New city/good historical accuracy fixes
 - NPC ship route improvements
-- Flutter UI enhancements (hex map renderer, price charts)
 - Additional ship types or building types
 - Balance tuning (elasticity, production rates)
-
----
-
-## 📄 License
-
-MIT — see [LICENSE](LICENSE).
 
 ---
 
@@ -289,7 +254,6 @@ MIT — see [LICENSE](LICENSE).
 # Changelog
 
 All notable changes to Patrician III/IV are documented here.
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
@@ -357,16 +321,14 @@ PSQL_DB=traderdude ./app.sh
 | Historical accuracy | Fix city coordinates, population, production roles |
 | Balance tuning | Elasticity values, daily production rates, building costs |
 | NPC AI | Smarter route selection, NPC factions with personalities |
-| Flutter UI | Hex map renderer, price history charts, trade log view |
 | New content | Additional ship types, building types, goods (historical sources required) |
-| Testing | PostgreSQL function tests, Flutter widget tests |
+| Testing | PostgreSQL function tests, widget tests |
 
 ## Pull Request Guidelines
 
 1. **One feature / fix per PR** — keep diffs small and reviewable
 2. **SQL changes** — include both forward migration and rollback in `sql/`
 3. **Historical citations** — if adding or changing game data (prices, production, city populations), link a source
-4. **Flutter** — run `flutter analyze` and `flutter test` before submitting
 5. **Shell** — run `shellcheck app.sh patrician3.sh npc_ships.sh` (warnings are acceptable; errors are not)
 6. **Commit messages** — use present tense imperative: `Add counting house UI`, `Fix NPC ETA calculation`
 
@@ -376,7 +338,6 @@ Open a GitHub Issue with:
 - Steps to reproduce
 - Expected vs actual behaviour
 - PostgreSQL version (`psql --version`)
-- Flutter version if relevant (`flutter --version`)
 
 ## Game Balance Philosophy
 
@@ -398,8 +359,3 @@ Open a GitHub Issue with:
 - Table aliases: `ci` = cities, `g` = goods, `m` = market, `s` = ships
 - All new tables: `p3_` prefix
 - All new views: `p3_` prefix; admin views: `p3_admin_` prefix
-
-**Dart/Flutter:**
-- Follow `flutter analyze` rules
-- Riverpod for all async state (no raw `setState` for server data)
-- `PatricianTheme` constants for all colours — no raw `Color(0x...)` in widgets
