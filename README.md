@@ -1,6 +1,7 @@
-# ⚓ Patrician III / IV — Hanseatic Trading Simulation
+# ⚓ Trader Tycoon — Hanseatic Trading Simulation
 
 > A historically grounded medieval trade simulation set in the Hanseatic League, c. 1300.  
+> Build a merchant empire across the Hanseatic League and Mediterranean trade network.
 > Play as a Lübeck merchant, build a fleet, establish counting houses, and dominate Baltic trade.
 
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-blue.svg)](https://flutter.dev)

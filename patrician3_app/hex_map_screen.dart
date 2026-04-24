@@ -112,6 +112,18 @@ const _fallbackCities = [
   HexCity('Torun',        3, 88, Terrain.land,  'Baltic'),
   HexCity('Ripen',       11, 92, Terrain.coast, 'North Sea'),
   HexCity('Ladoga',      41,100, Terrain.land,  'East'),
+  // ── Patrician IV — Mediterranean (different coordinate space) ──────
+  // Med grid is offset: q+100 to separate from Baltic tiles visually
+  HexCity('Venice',       110, 10, Terrain.coast, 'Mediterranean'),
+  HexCity('Genoa',        104, 12, Terrain.coast, 'Mediterranean'),
+  HexCity('Marseille',    100, 11, Terrain.coast, 'Mediterranean'),
+  HexCity('Barcelona',     97, 13, Terrain.coast, 'Mediterranean'),
+  HexCity('Lisbon',        92, 14, Terrain.coast, 'Atlantic'),
+  HexCity('Constantinople',125,  8, Terrain.coast, 'Bosphorus'),
+  HexCity('Naples',        111, 14, Terrain.coast, 'Mediterranean'),
+  HexCity('Palermo',       108, 16, Terrain.coast, 'Mediterranean'),
+  HexCity('Tunis',         107, 18, Terrain.land,  'North Africa'),
+  HexCity('Alexandria',    118, 18, Terrain.coast, 'North Africa'),
 ];
 
 /// Key trade routes (city name pairs) — drawn as lines on the map
@@ -579,7 +591,7 @@ class _HexPainter extends CustomPainter {
   void _drawShipIndicators(Canvas canvas) {
     final dockedPorts = <String>{};
     for (final s in ships) {
-      if (s.status == 'docked') dockedPorts.add(s.currentCity);
+      if (s.status == 'docked' || s.etaDays == 0) dockedPorts.add(s.currentCity);
     }
 
     for (final city in cities) {
@@ -622,7 +634,7 @@ class _CityPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final dockedHere = ships.where((s) =>
-      s.currentCity == city.name && s.status == 'docked').toList();
+      s.currentCity == city.name && s.status == 'docked' || s.etaDays == 0).toList();
     final sailingHere = ships.where((s) => s.destination == city.name).toList();
 
     // Nearby cities within 6 hexes
@@ -757,12 +769,17 @@ class _DistancePanel extends StatelessWidget {
   final HexCity city;
   final List<(HexCity, int)> nearby;
   const _DistancePanel({required this.city, required this.nearby});
+  // Days = (hexDist × 50nm) ÷ (speed_kn × 24)
+  // Snaikka 5kn, Crayer 7kn, Cog 6kn, Galley 9kn, Carrack 5.5kn
 
   String _eta(int hexes) {
     // Snaikka: ~6 hex/month  ·  Crayer: ~8  ·  Hulk: ~9
-    final snaikka = max(1, (hexes / 6.0).ceil());
-    final crayer  = max(1, (hexes / 8.0).ceil());
-    return '$snaikka mo (Snaikka)  ·  $crayer mo (Crayer)';
+    // 1 hex = 50nm; Snaikka 5kn = 120nm/day; Crayer 7kn = 168nm/day
+    final snaikka = max(1, ((hexes * 50) / 120.0).ceil());
+    final crayer  = max(1, ((hexes * 50) / 168.0).ceil());
+    // speed: Snaikka 5kn=120nm/day, Crayer 7kn=168nm/day, Galley 9kn=216nm/day
+    final galley = max(1, (hexes * 50 ~/ 216).ceil());
+    return '${snaikka}d (Snaikka)  ·  ${crayer}d (Crayer)  ·  ${galley}d (Galley)';
   }
 
   @override
