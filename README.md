@@ -1,6 +1,6 @@
-# ⚓ Trader Tycoon — Hanseatic Trading Simulation
-
 <img width="1702" height="949" alt="startscreen" src="https://github.com/user-attachments/assets/42ff3fea-ad14-4cec-b018-5a051a070c72" />
+
+# ⚓ Trader Tycoon — Hanseatic Trading Simulation
 
 > A historically grounded medieval trade simulation set in the Hanseatic League, c. 1300.  
 > Build a merchant empire across the Hanseatic League and Mediterranean trade network.
