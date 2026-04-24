@@ -2413,8 +2413,8 @@ p3_interactive_buy() {
     local goods_list
     goods_list=$(p3_psql --tuples-only -c "
         SELECT RPAD(g.name, 14) ||
-               '  ASK:'  || RPAD(m.current_buy::text, 9) ||
-               'BID:'    || RPAD(m.current_sell::text, 9) ||
+               '  BUY:'  || RPAD(m.current_buy::text, 9) ||
+               'SELL:'   || RPAD(m.current_sell::text, 9) ||
                'STK:'    || RPAD(m.stock::text, 6) ||
                COALESCE(mv.signal,'–')
         FROM   p3_market m
@@ -2429,7 +2429,7 @@ p3_interactive_buy() {
     clear
     gum style --foreground 33 --bold "🛒  BUY GOODS — $scity  |  💰 ${gold}g  |  🚢 free cargo: ${cargo_free}"
     echo
-    gum style --foreground 244 "  $(printf '%-14s  %-16s %-16s %-10s %s' 'GOOD' 'ASK' 'BID' 'STOCK' 'SIG')"
+    gum style --foreground 244 "  $(printf '%-14s  %-16s %-16s %-10s %s' 'GOOD' 'BUYING PRICE' 'SELLING PRICE' 'STOCK' 'SIG')"
     echo
 
     local chosen_line
@@ -2463,13 +2463,14 @@ p3_interactive_buy() {
         LIMIT 1;" 2>/dev/null | sed 's/|/\n/g; s/^ *//; s/ *$//' \
         || printf '0\n0\n0\n0.5\n80\n')
 
-    # Compute marginal curve in bash — one row per unit qty 1..20
-    # mid = (ask/1.08 + bid/0.92) / 2
-    # unit_ask(q) = mid * (stock_ref / max(stock - q + 1, 1))^elast_buy * 1.08
-    # running total = sum of unit_ask(1..q)
+    # Compute marginal buy curve in bash — one row per unit qty 1..20
+    # Anchored so that q=1 costs exactly the current Buying Price (ask).
+    # unit_price(q) = ask * (stock / max(stock - q + 1, 1))^elast_buy
+    #   q=1  → ask*(stock/stock)^e  = ask  ✓
+    #   q=2  → ask*(stock/(stock-1))^e > ask  ✓ (less stock = more expensive)
     clear
     gum style --foreground 212 --bold "📈  MARGINAL PRICE CURVE — $good in $scity"
-    gum style --foreground 244 "    Current ASK: ${ask}g  |  BID: ${bid}g  |  Stock: ${stock}  |  Your gold: ${gold}g"
+    gum style --foreground 244 "    Current Buying Price: ${ask}g  |  Selling Price: ${bid}g  |  Stock: ${stock}  |  Your gold: ${gold}g"
     echo
     printf '  %-6s  %-12s  %-14s  %s\n' "QTY" "UNIT PRICE" "TOTAL COST" "AFFORDABLE?"
 
@@ -2477,13 +2478,12 @@ p3_interactive_buy() {
     local i
     for i in $(seq 1 20); do
         local unit_price total_now affordable
-        unit_price=$(awk -v ask="$ask" -v bid="$bid" -v stk="$stock" \
-                         -v sref="$stock_ref" -v e="$elast_buy" -v q="$i" '
+        unit_price=$(awk -v ask="$ask" -v stk="$stock" \
+                         -v e="$elast_buy" -v q="$i" '
             BEGIN {
-                mid = (ask/1.08 + bid/0.92) / 2.0
                 denom = stk - q + 1
                 if (denom < 1) denom = 1
-                printf "%.2f", mid * (sref/denom)^e * 1.08
+                printf "%.2f", ask * (stk / denom)^e
             }')
         running_total=$(awk -v rt="$running_total" -v up="$unit_price" \
             'BEGIN { printf "%.2f", rt + up }')
@@ -2502,13 +2502,12 @@ p3_interactive_buy() {
     local total_cost=0
     for i in $(seq 1 "$qty"); do
         local up
-        up=$(awk -v ask="$ask" -v bid="$bid" -v stk="$stock" \
-                 -v sref="$stock_ref" -v e="$elast_buy" -v q="$i" '
+        up=$(awk -v ask="$ask" -v stk="$stock" \
+                 -v e="$elast_buy" -v q="$i" '
             BEGIN {
-                mid = (ask/1.08 + bid/0.92) / 2.0
                 denom = stk - q + 1
                 if (denom < 1) denom = 1
-                printf "%.2f", mid * (sref/denom)^e * 1.08
+                printf "%.2f", ask * (stk / denom)^e
             }')
         total_cost=$(awk -v tc="$total_cost" -v up="$up" 'BEGIN { printf "%.2f", tc + up }')
     done
@@ -2539,7 +2538,7 @@ p3_interactive_sell() {
     cargo_list=$(p3_psql --tuples-only -c "
         SELECT RPAD(g.name, 14) ||
                '  ABOARD:' || RPAD(c.quantity::text, 7) ||
-               'BID:'      || RPAD(m.current_sell::text, 9) ||
+               'SELL:'     || RPAD(m.current_sell::text, 9) ||
                'STK:'      || RPAD(m.stock::text, 6) ||
                'EST:'      || ROUND(m.current_sell * c.quantity, 2) || 'g'
         FROM   p3_cargo c
@@ -2558,7 +2557,7 @@ p3_interactive_sell() {
     clear
     gum style --foreground 214 --bold "💰  SELL GOODS — $scity  |  Your gold: ${gold}g"
     echo
-    gum style --foreground 244 "  $(printf '%-14s  %-14s %-16s %-10s %s' 'GOOD' 'ABOARD' 'BID' 'STOCK' 'EST.VALUE')"
+    gum style --foreground 244 "  $(printf '%-14s  %-14s %-16s %-10s %s' 'GOOD' 'ABOARD' 'SELLING PRICE' 'STOCK' 'EST.VALUE')"
     echo
 
     local chosen_line
@@ -2595,11 +2594,14 @@ p3_interactive_sell() {
         || printf '0\n0\n0\n0\n0.5\n80\n')
 
     # Build marginal sell curve in bash
-    # Selling increases city stock → price falls further with each unit
-    # unit_bid(q) = mid * (stock_ref / max(stock + q, 1))^elast_sell * 0.92
+    # Selling increases city stock → price falls with each unit sold.
+    # Anchored so that q=1 yields exactly the current Selling Price (bid).
+    # unit_price(q) = bid * (stock / max(stock + q - 1, 1))^elast_sell
+    #   q=1  → bid*(stock/stock)^e  = bid  ✓
+    #   q=2  → bid*(stock/(stock+1))^e < bid  ✓ (more stock = less rare)
     clear
     gum style --foreground 214 --bold "📉  MARGINAL SELL CURVE — $good in $scity"
-    gum style --foreground 244 "    Current BID: ${bid}g  |  ASK: ${ask}g  |  City stock: ${stock}  |  Aboard: ${aboard}"
+    gum style --foreground 244 "    Current Selling Price: ${bid}g  |  Buying Price: ${ask}g  |  City stock: ${stock}  |  Aboard: ${aboard}"
     echo
     printf '  %-6s  %-12s  %s\n' "QTY" "UNIT PRICE" "TOTAL REVENUE"
 
@@ -2607,13 +2609,12 @@ p3_interactive_sell() {
     local i
     for i in $(seq 1 20); do
         local unit_price
-        unit_price=$(awk -v ask="$ask" -v bid="$bid" -v stk="$stock" \
-                         -v sref="$stock_ref" -v e="$elast_sell" -v q="$i" '
+        unit_price=$(awk -v bid="$bid" -v stk="$stock" \
+                         -v e="$elast_sell" -v q="$i" '
             BEGIN {
-                mid = (ask/1.08 + bid/0.92) / 2.0
-                denom = stk + q
+                denom = stk + q - 1
                 if (denom < 1) denom = 1
-                printf "%.2f", mid * (sref/denom)^e * 0.92
+                printf "%.2f", bid * (stk / denom)^e
             }')
         running_total=$(awk -v rt="$running_total" -v up="$unit_price" \
             'BEGIN { printf "%.2f", rt + up }')
@@ -2629,13 +2630,12 @@ p3_interactive_sell() {
     local total_revenue=0
     for i in $(seq 1 "$qty"); do
         local up
-        up=$(awk -v ask="$ask" -v bid="$bid" -v stk="$stock" \
-                 -v sref="$stock_ref" -v e="$elast_sell" -v q="$i" '
+        up=$(awk -v bid="$bid" -v stk="$stock" \
+                 -v e="$elast_sell" -v q="$i" '
             BEGIN {
-                mid = (ask/1.08 + bid/0.92) / 2.0
-                denom = stk + q
+                denom = stk + q - 1
                 if (denom < 1) denom = 1
-                printf "%.2f", mid * (sref/denom)^e * 0.92
+                printf "%.2f", bid * (stk / denom)^e
             }')
         total_revenue=$(awk -v tr="$total_revenue" -v up="$up" 'BEGIN { printf "%.2f", tr + up }')
     done
@@ -2868,7 +2868,7 @@ patrician_menu() {
                     pause; continue
                 fi
                 p3_psql -c "
-                    SELECT good, current_buy AS ask, current_sell AS bid,
+                    SELECT good, current_buy AS buying_price, current_sell AS selling_price,
                            stock, signal
                     FROM p3_visible_market_view WHERE city = '$city'
                     ORDER BY good;" ;;
