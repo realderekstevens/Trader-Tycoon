@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  patrician3.sh  —  §14  Patrician III + IV  (drop-in replacement)
+#  app.sh  —  Patrician III + IV  (self-contained, all features integrated)
 #
-#  POINTY-TOP HEX EDITION  (converted from flat-top)
+#  POINTY-TOP HEX EDITION
 #  Reference: https://www.redblobgames.com/grids/hexagons/implementation.html
 #
 #  Hex system: pointy-top axial coordinates (q, r)
@@ -12,53 +12,36 @@
 #    · Distance = max(|q₁-q₂|, |r₁-r₂|, |s₁-s₂|)
 #    · 1 hex ≈ 50 nautical miles
 #
-#  Pointy-top neighbours (±q, ±r, and two mixed):
-#    (+1,0) (+1,-1) (0,-1) (-1,0) (-1,+1) (0,+1)
-#
 #  Geo → hex formula (Lübeck as map origin 0,0):
 #    At ~54 °N:  1° lat ≈ 60 nm  →  50 nm = 0.8333 ° lat per hex
 #                1° lon ≈ 35.4 nm →  50 nm = 1.413  ° lon per hex
 #    q = ROUND( (lon - 10.687) / 1.413 )
 #    r = ROUND( (53.866 - lat) / 0.833 )   ← note negation: r↑ = south
 #
-#  Why pointy-top?
-#    · N–S runs fall along vertical columns (intuitive for Baltic trade lanes)
-#    · Cities at similar latitudes align cleanly in the same row (r)
-#    · The tighter E–W hex spacing matches how the Baltic coast is shaped
-#
-#  Scale rationale (answering: "should Lübeck be hex 106×, 538y?"):
-#    No — that 1:1 degree-to-hex mapping creates a ~500×600 tile grid, far
-#    too sparse.  At 1 hex = 50 nm the entire Hanseatic world fits in roughly
-#    ±15 q × ±10 r (30×20 tiles), which is tight and aesthetically readable.
-#    The Mediterranean expansion sits below and overlaps slightly (r +10..+27),
-#    sharing the same coordinate space without needing an artificial offset.
-#
-#  All features retained from original:
+#  Features:
 #    · Daily time system  (game_day 1–360, eta_days, travel_days)
 #    · Ship speed matters (ETA = distance_nm ÷ speed_knots ÷ 24)
 #    · Per-unit marginal elasticity on every buy/sell
+#    · Seasonal price curves, panic/glut mechanics, bid/ask spread
 #    · Rebalanced daily production rates (fractional, sensible ratios)
+#    · Player visibility / fog of war — prices only visible where player
+#      has a docked ship or counting house; Lübeck always visible
+#    · Admin privilege system — arbitrage, global market, NPC logs
+#      are hidden behind is_admin = TRUE
+#    · NPC ship AI — 13 automated merchant ships specialised by good,
+#      buying from surplus cities and selling to deficit cities
+#    · Counting houses — establish permanent market presence in a city
 #    · Patrician IV Mediterranean expansion
 #        – 10 Med cities (Venice, Genoa, Constantinople…)
 #        – 8 Med goods  (Silk, Glass, Olive Oil, Ivory…)
 #        – 3 new ships  (Cog 6kn, Galley 9kn, Carrack 5.5kn)
-#        – Cross-league arbitrage view
-#
-#  HOW TO INTEGRATE INTO app.sh:
-#    Replace your existing §14 block with this file.  Then:
-#    1. Add  source "$(dirname "$0")/patrician3.sh"  near the top of app.sh,
-#       after the existing source/config block.
-#    2. Add  "🌊 Patrician IV"  to the patrician_menu choose list
-#       and  "🌊 Patrician IV") p3_p4_menu ;;  to the case block.
-#    3. Replace  "Advance One Month")  p3_advance_month  with
-#                "Advance One Day")    p3_advance_day
-#    4. Replace  "Give Sail Order" case body with a call to p3_sail_ship.
+#    · Real-time tick daemon via pg_notify
 #
 #  DEPENDENCIES: psql  gum
 # =============================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG  (inherits from app.sh; safe to source standalone too)
+#  CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 P3_DB="${PSQL_DB:-traderdude}"
 P3_USER="${PSQL_USER:-postgres}"
@@ -99,8 +82,7 @@ p3_pick_good() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STANDALONE HELPERS  (provided by app.sh when sourced; defined here for
-#  direct execution of patrician3.sh as a self-contained game)
+#  STANDALONE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 declare -a MENU_BREADCRUMB=("Main")
 
@@ -139,14 +121,13 @@ require() {
     }
 }
 
-# Dependency check (only when run standalone — sourcing app.sh does its own check)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     require gum
     require psql
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14a  SCHEMA  (p3_create_tables)
+#  §14a  SCHEMA
 # ─────────────────────────────────────────────────────────────────────────────
 p3_create_tables() {
     info "Creating Patrician III + IV tables…"
@@ -160,7 +141,8 @@ CREATE TABLE IF NOT EXISTS p3_player (
     gold       NUMERIC(12,2) NOT NULL DEFAULT 2000,
     rank       TEXT          NOT NULL DEFAULT 'Apprentice',
     game_year  INTEGER       NOT NULL DEFAULT 1300,
-    game_day   INTEGER       NOT NULL DEFAULT 1 CHECK (game_day BETWEEN 1 AND 360)
+    game_day   INTEGER       NOT NULL DEFAULT 1 CHECK (game_day BETWEEN 1 AND 360),
+    is_admin   BOOLEAN       NOT NULL DEFAULT FALSE
 );
 
 -- ── Goods catalogue ───────────────────────────────────────────────────────
@@ -172,20 +154,20 @@ CREATE TABLE IF NOT EXISTS p3_goods (
     sell_price_min   NUMERIC(10,2),
     sell_price_max   NUMERIC(10,2),
     max_satisfaction NUMERIC(10,2),
-    base_production  NUMERIC(8,4)  NOT NULL DEFAULT 0.5,  -- units/day
+    base_production  NUMERIC(8,4)  NOT NULL DEFAULT 0.5,
     is_raw_material  BOOLEAN       NOT NULL DEFAULT FALSE,
     notes            TEXT
 );
 
--- ── Cities  (league distinguishes Hanse vs Med for P4) ───────────────────
+-- ── Cities ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS p3_cities (
     city_id    SERIAL  PRIMARY KEY,
     name       TEXT    NOT NULL UNIQUE,
     region     TEXT    NOT NULL DEFAULT 'Baltic',
     population INTEGER NOT NULL DEFAULT 5000,
     league     TEXT    NOT NULL DEFAULT 'Hanseatic',
-    hex_q      INTEGER DEFAULT NULL,  -- pointy-top axial q (≈ east)
-    hex_r      INTEGER DEFAULT NULL,  -- pointy-top axial r (≈ south)
+    hex_q      INTEGER DEFAULT NULL,
+    hex_r      INTEGER DEFAULT NULL,
     notes      TEXT
 );
 
@@ -223,9 +205,7 @@ CREATE TABLE IF NOT EXISTS p3_price_history (
     UNIQUE (city_id, good_id, game_year, game_day)
 );
 
--- ── Ships  (speed_knots drives eta_days calculation) ─────────────────────
--- Types: Snaikka(50,5kn) Crayer(80,7kn) Hulk(160,4kn)
---        Cog(120,6kn) Galley(90,9kn) Carrack(220,5.5kn)
+-- ── Ships ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS p3_ships (
     ship_id      SERIAL  PRIMARY KEY,
     name         TEXT           NOT NULL,
@@ -250,8 +230,7 @@ CREATE TABLE IF NOT EXISTS p3_cargo (
     UNIQUE (ship_id, good_id)
 );
 
--- ── Routes  (travel_days at Snaikka-5kn baseline) ────────────────────────
--- Per-ship ETA = ROUND(distance_nm / (speed_knots * 24))
+-- ── Routes ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS p3_routes (
     route_id      SERIAL PRIMARY KEY,
     name          TEXT    NOT NULL,
@@ -295,16 +274,16 @@ CREATE TABLE IF NOT EXISTS p3_ship_orders (
     created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
--- ── Building types  (daily_maintenance replaces monthly_maintenance) ──────
+-- ── Building types ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS p3_building_types (
     building_type_id       SERIAL        PRIMARY KEY,
     name                   TEXT          NOT NULL UNIQUE,
     output_good_id         INTEGER       NOT NULL REFERENCES p3_goods(good_id),
     input_good_id          INTEGER       REFERENCES p3_goods(good_id),
     input_units_per_output NUMERIC(6,3)  NOT NULL DEFAULT 0,
-    base_production        NUMERIC(8,4)  NOT NULL DEFAULT 0.25,  -- units/day
+    base_production        NUMERIC(8,4)  NOT NULL DEFAULT 0.25,
     construction_cost      INTEGER       NOT NULL DEFAULT 5000,
-    daily_maintenance      NUMERIC(8,2)  NOT NULL DEFAULT 20,    -- gold/day
+    daily_maintenance      NUMERIC(8,2)  NOT NULL DEFAULT 20,
     notes                  TEXT
 );
 
@@ -318,20 +297,6 @@ CREATE TABLE IF NOT EXISTS p3_player_buildings (
 );
 
 -- ── Hex grid (POINTY-TOP axial, 1 hex ≈ 50 nm) ───────────────────────────
---
---  Pointy-top axial coordinate system (redblobgames §2 Layout):
---    · q-axis points east-northeast  (flat-top had q pointing straight east)
---    · r-axis points south-southeast
---    · s = -q - r  (cube constraint, stored as generated column)
---
---  Neighbour directions (pointy-top):
---    (q+1, r  ) E   (q-1, r  ) W
---    (q  , r-1) NE  (q  , r+1) SW
---    (q+1, r-1) NW  (q-1, r+1) SE
---
---  Distance between hex A and hex B:
---    max( |qa-qb|, |ra-rb|, |sa-sb| )
---
 CREATE TABLE IF NOT EXISTS p3_hex_tiles (
     hex_id  SERIAL  PRIMARY KEY,
     q       INTEGER NOT NULL,
@@ -346,50 +311,6 @@ CREATE TABLE IF NOT EXISTS p3_hex_tiles (
 );
 CREATE INDEX IF NOT EXISTS idx_p3_hex_tiles_city ON p3_hex_tiles(city_id);
 
--- ── Hex SQL helpers ───────────────────────────────────────────────────────
---
---  Distance formula (cube / axial — same for pointy-top and flat-top):
---    max(|q1-q2|, |r1-r2|, |(-q1-r1)-(-q2-r2)|)
---
-CREATE OR REPLACE FUNCTION p3_hex_distance(q1 INT, r1 INT, q2 INT, r2 INT)
-RETURNS INTEGER LANGUAGE sql IMMUTABLE AS $$
-    SELECT GREATEST(ABS(q1-q2), ABS(r1-r2), ABS((-q1-r1)-(-q2-r2)));
-$$;
-
---  Pointy-top neighbour directions (6 neighbours):
---    redblobgames hex_directions for pointy-top:
---    (1,0) (1,-1) (0,-1) (-1,0) (-1,1) (0,1)
---
-CREATE OR REPLACE FUNCTION p3_hex_neighbors(q INT, r INT)
-RETURNS TABLE(nq INT, nr INT) LANGUAGE sql IMMUTABLE AS $$
-    VALUES
-        (q+1, r  ),   -- E
-        (q+1, r-1),   -- NE
-        (q  , r-1),   -- NW
-        (q-1, r  ),   -- W
-        (q-1, r+1),   -- SW
-        (q  , r+1);   -- SE
-$$;
-
--- Travel days from hex distance: 1 hex = 50 nm, speed_kn × 24 = nm/day
-CREATE OR REPLACE FUNCTION p3_travel_days(
-    city_a_id  INT,
-    city_b_id  INT,
-    speed_kn   NUMERIC DEFAULT 5.0
-) RETURNS INTEGER LANGUAGE sql STABLE AS $$
-    SELECT GREATEST(1,
-        ROUND(
-            (p3_hex_distance(ca.hex_q, ca.hex_r, cb.hex_q, cb.hex_r) * 50.0)
-            / (speed_kn * 24.0)
-        )::INTEGER
-    )
-    FROM p3_cities ca, p3_cities cb
-    WHERE ca.city_id = city_a_id
-      AND cb.city_id = city_b_id
-      AND ca.hex_q IS NOT NULL
-      AND cb.hex_q IS NOT NULL;
-$$;
-
 -- ── Marginal pricing elasticity ───────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS p3_good_elasticity (
     good_id         INTEGER PRIMARY KEY REFERENCES p3_goods(good_id) ON DELETE CASCADE,
@@ -399,122 +320,6 @@ CREATE TABLE IF NOT EXISTS p3_good_elasticity (
     price_floor_pct NUMERIC(5,3) NOT NULL DEFAULT 0.30,
     price_ceil_pct  NUMERIC(5,3) NOT NULL DEFAULT 3.00
 );
-
--- ── Enhanced multi-factor marginal price function ────────────────────────
---
---  Factors applied on top of the base stock/elasticity power law:
---    1. SEASONAL  — sine wave over the 360-day year, phase-shifted per
---                   category (food cheap at harvest, luxury peaks year-end)
---    2. PANIC     — extra spike when stock < 20 % of reference (hoarding
---                   premium); symmetric glut discount above 200 %
---    3. CATEGORY  — luxury goods are intrinsically more volatile than staples
---    4. SPREAD    — ASK = midpoint × 1.08, BID = midpoint × 0.92
---    5. CLAMP     — hard floor / ceiling from p3_good_elasticity
---
---  p_qty_offset = units already purchased this session (0 for first unit)
---  so the function returns the *marginal* price of the next unit.
---
-CREATE OR REPLACE FUNCTION p3_marginal_price(
-    p_city_id    INT,
-    p_good_id    INT,
-    p_action     TEXT,      -- 'buy'  or  'sell'
-    p_qty_offset INT,       -- units already transacted this session
-    p_game_day   INT        -- 1..360  for seasonal shift
-) RETURNS NUMERIC LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    v_mid             NUMERIC;
-    v_stock           INT;
-    v_stock_ref       INT;
-    v_elast           NUMERIC;
-    v_floor_pct       NUMERIC;
-    v_ceil_pct        NUMERIC;
-    v_category        TEXT;
-    v_effective_stock INT;
-    v_season_mod      NUMERIC;
-    v_vol_mod         NUMERIC;
-    v_scarcity        NUMERIC;
-    v_panic_mod       NUMERIC;
-    v_price           NUMERIC;
-BEGIN
-    SELECT
-        (m.current_buy / 1.08 + m.current_sell / 0.92) / 2.0,
-        m.stock,
-        e.stock_ref,
-        g.category,
-        CASE WHEN p_action = 'buy' THEN e.elasticity_buy
-             ELSE e.elasticity_sell END,
-        e.price_floor_pct,
-        e.price_ceil_pct
-    INTO v_mid, v_stock, v_stock_ref, v_category, v_elast, v_floor_pct, v_ceil_pct
-    FROM p3_market m
-    JOIN p3_goods g           ON g.good_id = m.good_id
-    JOIN p3_good_elasticity e ON e.good_id = g.good_id
-    WHERE m.city_id = p_city_id AND m.good_id = p_good_id;
-
-    IF NOT FOUND THEN RETURN NULL; END IF;
-
-    -- Effective stock moves in opposite directions for buy vs sell
-    v_effective_stock := GREATEST(
-        CASE WHEN p_action = 'buy'
-             THEN v_stock - p_qty_offset
-             ELSE v_stock + p_qty_offset
-        END, 1
-    );
-
-    -- 1. Seasonal factor  (±10 % amplitude, 360-day period)
-    --    Phase offsets: food cheap mid-year (harvest), material peaks in
-    --    summer building season, luxury peaks at year-end celebrations.
-    v_season_mod := 1.0 + 0.10 * SIN(
-        (p_game_day::NUMERIC / 360.0) * 2.0 * PI()
-        + CASE v_category
-            WHEN 'food'     THEN PI()           -- trough at day 180
-            WHEN 'material' THEN PI() / 2.0     -- peak at day  90
-            WHEN 'luxury'   THEN -PI() / 2.0    -- peak at day 270
-            ELSE PI() / 4.0
-          END
-    );
-
-    -- 2. Category volatility multiplier
-    v_vol_mod := CASE v_category
-        WHEN 'luxury'    THEN 1.25   -- exotic goods swing the hardest
-        WHEN 'food'      THEN 0.88   -- staple prices are sticky
-        WHEN 'material'  THEN 1.05
-        ELSE 1.0
-    END;
-
-    -- 3. Core power-law scarcity
-    v_scarcity := POWER(
-        v_stock_ref::NUMERIC / v_effective_stock::NUMERIC,
-        v_elast
-    );
-
-    -- 4. Panic / glut non-linearity
-    --    Below 20 % of reference: price spikes steeply (panic buying premium)
-    --    Above 200 % of reference: price further depressed  (glut discount)
-    v_panic_mod := CASE
-        WHEN v_effective_stock < v_stock_ref * 0.20 THEN
-            1.0 + 0.60 * (1.0 - v_effective_stock::NUMERIC
-                               / (v_stock_ref::NUMERIC * 0.20))
-        WHEN v_effective_stock > v_stock_ref * 2.0 THEN
-            1.0 - 0.20 * LEAST(
-                (v_effective_stock::NUMERIC / (v_stock_ref::NUMERIC * 2.0)) - 1.0,
-                1.0)
-        ELSE 1.0
-    END;
-
-    v_price := v_mid * v_season_mod * v_vol_mod * v_scarcity * v_panic_mod;
-
-    -- 5. Bid/Ask spread
-    IF p_action = 'buy'  THEN v_price := v_price * 1.08; END IF;
-    IF p_action = 'sell' THEN v_price := v_price * 0.92; END IF;
-
-    -- 6. Hard floor / ceiling
-    RETURN GREATEST(
-        v_mid * v_floor_pct,
-        LEAST(v_mid * v_ceil_pct, ROUND(v_price, 2))
-    );
-END;
-$$;
 
 -- ── Limit orders ──────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS p3_limit_orders (
@@ -548,6 +353,238 @@ CREATE TABLE IF NOT EXISTS p3_trade_log (
     logged_at   TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
+-- ── Counting houses ───────────────────────────────────────────────────────
+--  A counting house grants permanent market visibility in that city and
+--  enables limit orders to execute there without a ship present.
+CREATE TABLE IF NOT EXISTS p3_counting_houses (
+    ch_id        SERIAL PRIMARY KEY,
+    city_name    TEXT   NOT NULL,
+    city_id      INTEGER NOT NULL REFERENCES p3_cities(city_id) ON DELETE CASCADE,
+    established  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (city_id)
+);
+
+-- ── NPC factions ──────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS p3_npc_factions (
+    faction_id   SERIAL PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    home_city    TEXT NOT NULL,
+    description  TEXT
+);
+
+-- ── NPC ship specialisations and AI state ────────────────────────────────
+CREATE TABLE IF NOT EXISTS p3_npc_ships (
+    npc_ship_id      INTEGER  PRIMARY KEY REFERENCES p3_ships(ship_id) ON DELETE CASCADE,
+    good_id          INTEGER  NOT NULL REFERENCES p3_goods(good_id),
+    home_city        TEXT     NOT NULL DEFAULT 'Lübeck',
+    ai_state         TEXT     NOT NULL DEFAULT 'seeking'
+                              CHECK (ai_state IN ('seeking','loading','sailing','unloading','returning')),
+    target_buy_city  TEXT,
+    target_sell_city TEXT,
+    last_profit      NUMERIC(12,2) DEFAULT 0,
+    total_profit     NUMERIC(12,2) DEFAULT 0,
+    trips_completed  INTEGER  NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_p3_npc_good ON p3_npc_ships(good_id);
+
+-- ── NPC trade log (admin-visible only) ───────────────────────────────────
+CREATE TABLE IF NOT EXISTS p3_npc_trade_log (
+    log_id      SERIAL PRIMARY KEY,
+    game_year   INTEGER,
+    game_day    INTEGER,
+    ship_id     INTEGER REFERENCES p3_ships(ship_id),
+    ship_name   TEXT,
+    good_id     INTEGER REFERENCES p3_goods(good_id),
+    good_name   TEXT,
+    action      TEXT,
+    city        TEXT,
+    quantity    INTEGER,
+    price       NUMERIC(10,2),
+    profit      NUMERIC(12,2),
+    logged_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ── Hex SQL helpers ───────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION p3_hex_distance(q1 INT, r1 INT, q2 INT, r2 INT)
+RETURNS INTEGER LANGUAGE sql IMMUTABLE AS $$
+    SELECT GREATEST(ABS(q1-q2), ABS(r1-r2), ABS((-q1-r1)-(-q2-r2)));
+$$;
+
+CREATE OR REPLACE FUNCTION p3_hex_neighbors(q INT, r INT)
+RETURNS TABLE(nq INT, nr INT) LANGUAGE sql IMMUTABLE AS $$
+    VALUES
+        (q+1, r  ),
+        (q+1, r-1),
+        (q  , r-1),
+        (q-1, r  ),
+        (q-1, r+1),
+        (q  , r+1);
+$$;
+
+CREATE OR REPLACE FUNCTION p3_travel_days(
+    city_a_id  INT,
+    city_b_id  INT,
+    speed_kn   NUMERIC DEFAULT 5.0
+) RETURNS INTEGER LANGUAGE sql STABLE AS $$
+    SELECT GREATEST(1,
+        ROUND(
+            (p3_hex_distance(ca.hex_q, ca.hex_r, cb.hex_q, cb.hex_r) * 50.0)
+            / (speed_kn * 24.0)
+        )::INTEGER
+    )
+    FROM p3_cities ca, p3_cities cb
+    WHERE ca.city_id = city_a_id
+      AND cb.city_id = city_b_id
+      AND ca.hex_q IS NOT NULL
+      AND cb.hex_q IS NOT NULL;
+$$;
+
+-- ── Counting house cost (scales with city population) ────────────────────
+CREATE OR REPLACE FUNCTION p3_counting_house_cost(p_city_name TEXT)
+RETURNS INTEGER LANGUAGE sql STABLE AS $$
+    SELECT CASE
+        WHEN population >= 50000 THEN 2000
+        WHEN population >= 20000 THEN 1500
+        WHEN population >= 10000 THEN 1000
+        ELSE 500
+    END
+    FROM p3_cities WHERE name = p_city_name;
+$$;
+
+-- ── Player visibility function ────────────────────────────────────────────
+--  Returns city_ids the player can currently see:
+--    · Admins see everything
+--    · Other players see cities with a docked ship, a counting house,
+--      or their home city (Lübeck)
+CREATE OR REPLACE FUNCTION p3_player_visible_city_ids()
+RETURNS TABLE(city_id INTEGER) LANGUAGE sql STABLE AS $$
+    SELECT ci.city_id FROM p3_cities ci
+    WHERE (SELECT is_admin FROM p3_player LIMIT 1)
+    UNION
+    SELECT ci2.city_id
+    FROM   p3_ships s
+    JOIN   p3_cities ci2 ON ci2.name = s.current_city
+    WHERE  s.owner = 'player' AND s.status = 'docked'
+      AND  NOT (SELECT is_admin FROM p3_player LIMIT 1)
+    UNION
+    SELECT ch.city_id
+    FROM   p3_counting_houses ch
+    WHERE  NOT (SELECT is_admin FROM p3_player LIMIT 1)
+    UNION
+    SELECT ci3.city_id
+    FROM   p3_cities ci3
+    JOIN   p3_player pl ON ci3.name = pl.home_city
+    WHERE  NOT (SELECT is_admin FROM p3_player LIMIT 1);
+$$;
+
+-- ── Marginal price function ───────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION p3_marginal_price(
+    p_city_id    INT,
+    p_good_id    INT,
+    p_action     TEXT,
+    p_qty_offset INT,
+    p_game_day   INT
+) RETURNS NUMERIC LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_mid             NUMERIC;
+    v_stock           INT;
+    v_stock_ref       INT;
+    v_elast           NUMERIC;
+    v_floor_pct       NUMERIC;
+    v_ceil_pct        NUMERIC;
+    v_category        TEXT;
+    v_effective_stock INT;
+    v_season_mod      NUMERIC;
+    v_vol_mod         NUMERIC;
+    v_scarcity        NUMERIC;
+    v_panic_mod       NUMERIC;
+    v_price           NUMERIC;
+BEGIN
+    SELECT
+        (m.current_buy / 1.08 + m.current_sell / 0.92) / 2.0,
+        m.stock,
+        e.stock_ref,
+        g.category,
+        CASE WHEN p_action = 'buy' THEN e.elasticity_buy
+             ELSE e.elasticity_sell END,
+        e.price_floor_pct,
+        e.price_ceil_pct
+    INTO v_mid, v_stock, v_stock_ref, v_category, v_elast, v_floor_pct, v_ceil_pct
+    FROM p3_market m
+    JOIN p3_goods g           ON g.good_id = m.good_id
+    JOIN p3_good_elasticity e ON e.good_id = g.good_id
+    WHERE m.city_id = p_city_id AND m.good_id = p_good_id;
+
+    IF NOT FOUND THEN RETURN NULL; END IF;
+
+    v_effective_stock := GREATEST(
+        CASE WHEN p_action = 'buy'
+             THEN v_stock - p_qty_offset
+             ELSE v_stock + p_qty_offset
+        END, 1
+    );
+
+    v_season_mod := 1.0 + 0.10 * SIN(
+        (p_game_day::NUMERIC / 360.0) * 2.0 * PI()
+        + CASE v_category
+            WHEN 'food'     THEN PI()
+            WHEN 'material' THEN PI() / 2.0
+            WHEN 'luxury'   THEN -PI() / 2.0
+            ELSE PI() / 4.0
+          END
+    );
+
+    v_vol_mod := CASE v_category
+        WHEN 'luxury'    THEN 1.25
+        WHEN 'food'      THEN 0.88
+        WHEN 'material'  THEN 1.05
+        ELSE 1.0
+    END;
+
+    v_scarcity := POWER(
+        v_stock_ref::NUMERIC / v_effective_stock::NUMERIC,
+        v_elast
+    );
+
+    v_panic_mod := CASE
+        WHEN v_effective_stock < v_stock_ref * 0.20 THEN
+            1.0 + 0.60 * (1.0 - v_effective_stock::NUMERIC
+                               / (v_stock_ref::NUMERIC * 0.20))
+        WHEN v_effective_stock > v_stock_ref * 2.0 THEN
+            1.0 - 0.20 * LEAST(
+                (v_effective_stock::NUMERIC / (v_stock_ref::NUMERIC * 2.0)) - 1.0,
+                1.0)
+        ELSE 1.0
+    END;
+
+    v_price := v_mid * v_season_mod * v_vol_mod * v_scarcity * v_panic_mod;
+
+    IF p_action = 'buy'  THEN v_price := v_price * 1.08; END IF;
+    IF p_action = 'sell' THEN v_price := v_price * 0.92; END IF;
+
+    RETURN GREATEST(
+        v_mid * v_floor_pct,
+        LEAST(v_mid * v_ceil_pct, ROUND(v_price, 2))
+    );
+END;
+$$;
+
+-- ── pg_notify helper ──────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION p3_notify_tick()
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_payload TEXT;
+BEGIN
+    SELECT json_build_object(
+        'year', game_year,
+        'day',  game_day,
+        'gold', ROUND(gold, 2),
+        'rank', rank
+    )::text INTO v_payload FROM p3_player LIMIT 1;
+    PERFORM pg_notify('p3_day_tick', COALESCE(v_payload, '{}'));
+END;
+$$;
+
 -- ── Fleet view ────────────────────────────────────────────────────────────
 CREATE OR REPLACE VIEW p3_fleet_view AS
 SELECT s.ship_id, s.name, s.ship_type, s.speed_knots,
@@ -561,7 +598,7 @@ WHERE  s.owner = 'player'
 GROUP  BY s.ship_id, s.name, s.ship_type, s.speed_knots,
           s.current_city, s.status, s.destination, s.eta_days, s.cargo_cap;
 
--- ── Market view ───────────────────────────────────────────────────────────
+-- ── Full market view (admin / NPC use only) ───────────────────────────────
 CREATE OR REPLACE VIEW p3_market_view AS
 SELECT
     ci.name           AS city,
@@ -586,8 +623,53 @@ JOIN p3_cities ci ON ci.city_id = m.city_id
 JOIN p3_goods  g  ON g.good_id  = m.good_id
 ORDER BY ci.name, g.name;
 
--- ── Arbitrage view ────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW p3_arbitrage_view AS
+-- ── Player-visible market view (fog of war filtered) ─────────────────────
+CREATE OR REPLACE VIEW p3_visible_market_view AS
+SELECT
+    ci.name           AS city,
+    ci.league,
+    g.name            AS good,
+    g.category,
+    m.current_buy,
+    m.current_sell,
+    g.buy_price_min   AS ref_buy_max,
+    g.sell_price_min  AS ref_sell_min,
+    g.sell_price_max  AS ref_sell_max,
+    m.stock,
+    ROUND(m.current_buy - m.current_sell, 2) AS spread,
+    CASE
+        WHEN m.current_buy  <= g.buy_price_min  THEN '🟢 GOOD BUY'
+        WHEN m.current_sell >= g.sell_price_max THEN '🔥 GREAT SELL'
+        WHEN m.current_sell >= g.sell_price_min THEN '💰 GOOD SELL'
+        ELSE '—'
+    END AS signal
+FROM   p3_market m
+JOIN   p3_cities ci ON ci.city_id = m.city_id
+JOIN   p3_goods  g  ON g.good_id  = m.good_id
+WHERE  m.city_id IN (SELECT city_id FROM p3_player_visible_city_ids())
+ORDER  BY ci.name, g.name;
+
+-- ── Lübeck market view (always visible on dashboard) ─────────────────────
+CREATE OR REPLACE VIEW p3_lubeck_market_view AS
+SELECT
+    g.name          AS good,
+    g.category,
+    m.current_buy   AS ask,
+    m.current_sell  AS bid,
+    m.stock,
+    CASE
+        WHEN m.current_buy  <= g.buy_price_min  THEN '🟢'
+        WHEN m.current_sell >= g.sell_price_max THEN '🔥'
+        WHEN m.current_sell >= g.sell_price_min THEN '💰'
+        ELSE '—'
+    END AS signal
+FROM   p3_market m
+JOIN   p3_cities ci ON ci.city_id = m.city_id AND ci.name = 'Lübeck'
+JOIN   p3_goods  g  ON g.good_id  = m.good_id
+ORDER  BY g.category, m.current_sell DESC;
+
+-- ── Admin arbitrage view ──────────────────────────────────────────────────
+CREATE OR REPLACE VIEW p3_admin_arbitrage_view AS
 SELECT
     bm.city          AS buy_city,
     sm.city          AS sell_city,
@@ -596,82 +678,113 @@ SELECT
     sm.current_sell  AS sell_price,
     ROUND(sm.current_sell - bm.current_buy, 2) AS profit_per_unit,
     bm.stock         AS buy_stock,
-    sm.stock         AS sell_stock
+    sm.stock         AS sell_stock,
+    COALESCE(
+        (SELECT r.travel_days FROM p3_routes r
+         WHERE (r.city_a = bm.city AND r.city_b = sm.city)
+            OR (r.city_b = bm.city AND r.city_a = sm.city)
+         ORDER BY r.travel_days LIMIT 1),
+        NULL
+    ) AS route_days_snaikka
 FROM   p3_market_view bm
 JOIN   p3_market_view sm
        ON sm.good = bm.good AND sm.city <> bm.city
 WHERE  sm.current_sell > bm.current_buy
 ORDER  BY profit_per_unit DESC;
 
--- ── pg_notify helper ─────────────────────────────────────────────────────
---
---  Called by the bash tick daemon every simulated game day.
---  Any external psql session can receive real-time events with:
---    LISTEN p3_day_tick;
---
---  Payload JSON: { "year": N, "day": N, "gold": N.NN, "rank": "..." }
---
-CREATE OR REPLACE FUNCTION p3_notify_tick()
-RETURNS void LANGUAGE plpgsql AS $$
-DECLARE
-    v_payload TEXT;
-BEGIN
-    SELECT json_build_object(
-        'year', game_year,
-        'day',  game_day,
-        'gold', ROUND(gold, 2),
-        'rank', rank
-    )::text INTO v_payload FROM p3_player LIMIT 1;
-    PERFORM pg_notify('p3_day_tick', COALESCE(v_payload, '{}'));
-END;
-$$;
+-- ── Admin cross-league arbitrage view ────────────────────────────────────
+CREATE OR REPLACE VIEW p3_admin_crossleague_view AS
+SELECT
+    av.buy_city, av.sell_city, av.good,
+    av.buy_price, av.sell_price, av.profit_per_unit,
+    av.route_days_snaikka,
+    CASE WHEN av.route_days_snaikka IS NOT NULL
+         THEN GREATEST(1, ROUND(av.route_days_snaikka * 5.0 / 7.0)::INTEGER)
+    END AS days_crayer,
+    CASE WHEN av.route_days_snaikka IS NOT NULL
+         THEN GREATEST(1, ROUND(av.route_days_snaikka * 5.0 / 9.0)::INTEGER)
+    END AS days_galley
+FROM   p3_admin_arbitrage_view av
+WHERE  av.profit_per_unit > 0
+  AND (
+      (av.buy_city  IN (SELECT name FROM p3_cities WHERE league = 'Hanseatic')
+       AND av.sell_city IN (SELECT name FROM p3_cities WHERE league = 'Mediterranean'))
+      OR
+      (av.buy_city  IN (SELECT name FROM p3_cities WHERE league = 'Mediterranean')
+       AND av.sell_city IN (SELECT name FROM p3_cities WHERE league = 'Hanseatic'))
+  )
+ORDER  BY av.profit_per_unit DESC;
+
+-- ── NPC ships visible to player (only in cities with player presence) ─────
+CREATE OR REPLACE VIEW p3_visible_npc_ships AS
+SELECT s.ship_id, s.name, s.ship_type, s.current_city,
+       s.status, s.destination, s.eta_days,
+       g.name AS specialisation
+FROM   p3_ships s
+JOIN   p3_npc_ships ns ON ns.npc_ship_id = s.ship_id
+JOIN   p3_goods g ON g.good_id = ns.good_id
+WHERE  s.owner = 'npc'
+  AND  s.current_city IN (
+      SELECT current_city FROM p3_ships
+      WHERE  owner = 'player' AND status = 'docked'
+      UNION
+      SELECT city_name FROM p3_counting_houses
+  );
+
+-- ── NPC fleet summary (admin only) ───────────────────────────────────────
+CREATE OR REPLACE VIEW p3_npc_fleet_summary AS
+SELECT s.name AS ship, g.name AS specialisation,
+       s.current_city, s.status,
+       COALESCE(s.destination, '—') AS destination,
+       ns.ai_state,
+       ns.trips_completed,
+       ROUND(ns.total_profit, 2)  AS total_profit,
+       ROUND(ns.last_profit, 2)   AS last_trip_profit
+FROM   p3_ships s
+JOIN   p3_npc_ships ns ON ns.npc_ship_id = s.ship_id
+JOIN   p3_goods g ON g.good_id = ns.good_id
+ORDER  BY s.name;
 
 SQL
-    success "✅  All Patrician III + IV tables and views created."
+    success "✅  All Patrician III + IV tables, functions and views created."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  §14b  SEED DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Goods (daily base_production — all 28 goods for P3 + P4) ──────────────
 p3_seed_goods() {
-    info "Seeding goods (daily production rates)…"
+    info "Seeding goods…"
     p3_psql <<'SQL'
 INSERT INTO p3_goods
     (name, category, buy_price_min, sell_price_min, sell_price_max,
      max_satisfaction, base_production, is_raw_material, notes)
 VALUES
--- ── Patrician III goods ───────────────────────────────────────────────────
--- Hanseatic staples — high daily output
     ('Beer',       'food',      38,    44,   60,   40,  1.600, FALSE, 'Big Four staple — Grain→Beer'),
     ('Bricks',     'material',  80,   130,  140, NULL,  0.480, FALSE, 'Building material'),
     ('Fish',       'food',     450,   490,  540,  515,  0.400, FALSE, 'Big Four — preserved with Salt'),
     ('Grain',      'food',      95,   140,  160,  141,  0.800,  TRUE, 'Big Four raw — abundant'),
     ('Hemp',       'material', 400,   500,  600, NULL,  0.320,  TRUE, 'Rope & rigging raw'),
     ('Honey',      'food',     110,   160,  180,  128,  0.260,  TRUE, 'Apiary raw'),
-    ('Salt',       'material',  27,    33,   50,   32,  1.120,  TRUE, 'Preservation raw — very high output'),
+    ('Salt',       'material',  27,    33,   50,   32,  1.120,  TRUE, 'Preservation raw'),
     ('Timber',     'material',  57,    75,   95,   70,  0.640,  TRUE, 'Shipbuilding raw'),
-    ('Pitch',      'material',  60,   100,  120, NULL,  0.380, FALSE, 'Waterproofing — pine resin'),
-    ('Whale Oil',  'material',  72,   100,  150,   96,  0.260, FALSE, 'Lamp oil — coastal only'),
+    ('Pitch',      'material',  60,   100,  120, NULL,  0.380, FALSE, 'Waterproofing'),
+    ('Whale Oil',  'material',  72,   100,  150,   96,  0.260, FALSE, 'Lamp oil'),
     ('Pottery',    'commodity', 185,  230,  250,  200,  0.320, FALSE, 'Low-tier luxury'),
--- Processed goods — require input, lower daily throughput
-    ('Cloth',      'luxury',   220,   340,  350,  242,  0.260, FALSE, 'Wool→Cloth — high profit'),
-    ('Iron Goods', 'luxury',   320,   430,  450,  300,  0.190, FALSE, 'Pig Iron→Iron Goods — best margins'),
-    ('Meat',       'food',     950,  1250, 1500, 1120,  0.160, FALSE, 'Cattle — expensive, low output'),
+    ('Cloth',      'luxury',   220,   340,  350,  242,  0.260, FALSE, 'Wool→Cloth'),
+    ('Iron Goods', 'luxury',   320,   430,  450,  300,  0.190, FALSE, 'Pig Iron→Iron Goods'),
+    ('Meat',       'food',     950,  1250, 1500, 1120,  0.160, FALSE, 'Cattle'),
     ('Leather',    'commodity', 250,  300,  340,  262,  0.320, FALSE, 'By-product of cattle'),
--- Expensive raws
-    ('Pig Iron',   'material', 900,  1200, 1300, NULL,  0.270,  TRUE, 'Smelter raw — needs for Iron Goods'),
-    ('Skins',      'luxury',   850,   900, 1400,  791,  0.160,  TRUE, 'Fur trade — very high value'),
-    ('Wool',       'material', 925,  1300, 1300, 1030,  0.230,  TRUE, 'Sheep raw — needed for Cloth'),
-    ('Spices',     'luxury',   280,   350,  400,  327,  0.097, FALSE, 'Mediterranean imports only'),
-    ('Wine',       'luxury',   230,   350,  400,  257,  0.160, FALSE, 'Vineyard — Rhine and Med'),
--- ── Patrician IV Mediterranean goods ─────────────────────────────────────
-    ('Olive Oil',  'luxury',   180,   240,  320,  210,  0.210, FALSE, 'Med staple — strong demand in North'),
-    ('Silk',       'luxury',  1200,  1600, 2200, 1400,  0.065, FALSE, 'Top-tier luxury — Constantinople'),
+    ('Pig Iron',   'material', 900,  1200, 1300, NULL,  0.270,  TRUE, 'Smelter raw'),
+    ('Skins',      'luxury',   850,   900, 1400,  791,  0.160,  TRUE, 'Fur trade'),
+    ('Wool',       'material', 925,  1300, 1300, 1030,  0.230,  TRUE, 'Sheep raw'),
+    ('Spices',     'luxury',   280,   350,  400,  327,  0.097, FALSE, 'Mediterranean imports'),
+    ('Wine',       'luxury',   230,   350,  400,  257,  0.160, FALSE, 'Vineyard'),
+    ('Olive Oil',  'luxury',   180,   240,  320,  210,  0.210, FALSE, 'Med staple'),
+    ('Silk',       'luxury',  1200,  1600, 2200, 1400,  0.065, FALSE, 'Top-tier luxury'),
     ('Glass',      'luxury',   320,   420,  550,  380,  0.120, FALSE, 'Venice specialty'),
     ('Sand',       'material',  10,    12,   18, NULL,  1.400,  TRUE, 'Glassworks raw'),
-    ('Cotton',     'material', 180,   240,  290, NULL,  0.320,  TRUE, 'Cloth alternative — warm regions'),
+    ('Cotton',     'material', 180,   240,  290, NULL,  0.320,  TRUE, 'Cloth alternative'),
     ('Alum',       'material', 140,   180,  220, NULL,  0.210,  TRUE, 'Cloth dyeing agent'),
     ('Dates',      'food',     160,   210,  260,  190,  0.190, FALSE, 'North African luxury food'),
     ('Ivory',      'luxury',  2400,  3200, 4500, 2800,  0.032, FALSE, 'Rare African trade good')
@@ -683,10 +796,9 @@ ON CONFLICT (name) DO UPDATE SET
     base_production  = EXCLUDED.base_production,
     notes            = EXCLUDED.notes;
 SQL
-    success "Goods seeded (28 goods, daily production rates)."
+    success "Goods seeded (28 goods)."
 }
 
-# ── Cities ────────────────────────────────────────────────────────────────
 p3_seed_cities() {
     info "Seeding Hanseatic cities…"
     p3_psql <<'SQL'
@@ -721,7 +833,7 @@ SQL
 }
 
 p3_seed_p4_cities() {
-    info "Seeding Mediterranean cities (P4)…"
+    info "Seeding Mediterranean cities…"
     p3_psql <<'SQL'
 INSERT INTO p3_cities (name, region, population, league) VALUES
     ('Venice',         'Mediterranean', 80000, 'Mediterranean'),
@@ -739,7 +851,6 @@ SQL
     success "Mediterranean cities seeded (10)."
 }
 
-# ── City production/demand (Hanseatic) ────────────────────────────────────
 p3_seed_city_goods() {
     info "Seeding Hanseatic city production & demand…"
     p3_psql <<'SQL'
@@ -819,7 +930,7 @@ SQL
 }
 
 p3_seed_p4_city_goods() {
-    info "Seeding Mediterranean city production & demand (P4)…"
+    info "Seeding Mediterranean city production…"
     p3_psql <<'SQL'
 INSERT INTO p3_city_goods (city_id, good_id, role, efficiency)
 SELECT ci.city_id, g.good_id, v.role, v.efficiency
@@ -867,9 +978,8 @@ SQL
     success "Mediterranean city production seeded."
 }
 
-# ── Market seed ───────────────────────────────────────────────────────────
 p3_seed_market() {
-    info "Seeding market prices (bid/ask spread model)…"
+    info "Seeding market prices…"
     p3_psql <<'SQL'
 INSERT INTO p3_market (city_id, good_id, current_buy, current_sell, stock)
 SELECT
@@ -899,51 +1009,47 @@ SQL
     success "Market seeded."
 }
 
-# ── Routes ────────────────────────────────────────────────────────────────
 p3_seed_routes() {
-    info "Seeding trade routes (travel_days at Snaikka 5kn baseline)…"
+    info "Seeding trade routes…"
     p3_psql <<'SQL'
 INSERT INTO p3_routes (name, city_a, city_b, distance_nm, travel_days, notes) VALUES
--- Hanseatic (P3)
-    ('Lübeck–Hamburg',      'Lübeck',    'Hamburg',        120,  1, 'Short hop — Grain/Beer/Fish'),
-    ('Lübeck–Rostock',      'Lübeck',    'Rostock',        100,  1, 'Grain/Hemp/Honey'),
-    ('Lübeck–Gdansk',       'Lübeck',    'Gdansk',         350,  3, 'Grain/Beer/Hemp east'),
-    ('Lübeck–Stockholm',    'Lübeck',    'Stockholm',      650,  5, 'Iron Goods/Pig Iron'),
-    ('Lübeck–Bergen',       'Lübeck',    'Bergen',         900,  8, 'Whale Oil/Pitch'),
-    ('Lübeck–London',       'Lübeck',    'London',        1050,  9, 'Cloth/Wool long route'),
-    ('Hamburg–Brugge',      'Hamburg',   'Brugge',         600,  5, 'Cloth/Wool/Salt west'),
-    ('Hamburg–Groningen',   'Hamburg',   'Groningen',      250,  2, 'Hemp/Bricks/Grain'),
-    ('Gdansk–Riga',         'Gdansk',    'Riga',           280,  2, 'Grain/Salt Baltic'),
-    ('Gdansk–Novgorod',     'Gdansk',    'Novgorod',       500,  4, 'Skins/Timber east'),
-    ('Stockholm–Ladoga',    'Stockholm', 'Ladoga',         450,  4, 'Pig Iron/Skins'),
-    ('Oslo–Aalborg',        'Oslo',      'Aalborg',        300,  3, 'Timber/Whale Oil'),
-    ('Riga–Reval',          'Riga',      'Reval',          200,  2, 'Salt/Skins/Grain Baltic'),
-    ('Reval–Novgorod',      'Reval',     'Novgorod',       280,  2, 'Skins/Timber east'),
-    ('London–Scarborough',  'London',    'Scarborough',    300,  3, 'Cloth/Wool/Beer British'),
-    ('Bergen–Scarborough',  'Bergen',    'Scarborough',    600,  5, 'Whale Oil to Britain'),
-    ('Visby–Gdansk',        'Visby',     'Gdansk',         220,  2, 'Cloth/Honey/Pottery'),
-    ('Visby–Lübeck',        'Visby',     'Lübeck',         420,  4, 'Cloth/Wool loop'),
-    ('Brugge–London',       'Brugge',    'London',         280,  2, 'Cloth/Salt/Spices'),
-    ('Cologne–Brugge',      'Cologne',   'Brugge',         240,  2, 'Wine/Honey Rhine'),
--- Mediterranean (P4)
-    ('Venice–Genoa',        'Venice',    'Genoa',          500,  3, 'Silk/Glass/Wine'),
-    ('Genoa–Marseille',     'Genoa',     'Marseille',      280,  2, 'Spices/Olive Oil'),
-    ('Marseille–Barcelona', 'Marseille', 'Barcelona',      400,  3, 'Wine/Cloth/Spices'),
-    ('Barcelona–Lisbon',    'Barcelona', 'Lisbon',         800,  6, 'Atlantic gateway'),
-    ('Venice–Constantinople','Venice',   'Constantinople', 1400,  9, 'Silk/Spices luxury run'),
-    ('Genoa–Tunis',         'Genoa',     'Tunis',          600,  4, 'Spices/Leather/Ivory'),
-    ('Marseille–Naples',    'Marseille', 'Naples',         600,  4, 'Olive Oil/Wine south'),
-    ('Naples–Palermo',      'Naples',    'Palermo',        280,  2, 'Grain/Salt Sicily'),
-    ('Genoa–Alexandria',    'Genoa',     'Alexandria',    1800, 12, 'Cotton/Ivory/Dates far east'),
-    ('Lisbon–London',       'Lisbon',    'London',        1200,  8, 'Connects Med to Hanse')
+    ('Lübeck–Hamburg',       'Lübeck',    'Hamburg',         120,  1, 'Grain/Beer/Fish'),
+    ('Lübeck–Rostock',       'Lübeck',    'Rostock',         100,  1, 'Grain/Hemp/Honey'),
+    ('Lübeck–Gdansk',        'Lübeck',    'Gdansk',          350,  3, 'Grain/Beer/Hemp east'),
+    ('Lübeck–Stockholm',     'Lübeck',    'Stockholm',       650,  5, 'Iron Goods/Pig Iron'),
+    ('Lübeck–Bergen',        'Lübeck',    'Bergen',          900,  8, 'Whale Oil/Pitch'),
+    ('Lübeck–London',        'Lübeck',    'London',         1050,  9, 'Cloth/Wool long route'),
+    ('Hamburg–Brugge',       'Hamburg',   'Brugge',          600,  5, 'Cloth/Wool/Salt west'),
+    ('Hamburg–Groningen',    'Hamburg',   'Groningen',       250,  2, 'Hemp/Bricks/Grain'),
+    ('Gdansk–Riga',          'Gdansk',    'Riga',            280,  2, 'Grain/Salt Baltic'),
+    ('Gdansk–Novgorod',      'Gdansk',    'Novgorod',        500,  4, 'Skins/Timber east'),
+    ('Stockholm–Ladoga',     'Stockholm', 'Ladoga',          450,  4, 'Pig Iron/Skins'),
+    ('Oslo–Aalborg',         'Oslo',      'Aalborg',         300,  3, 'Timber/Whale Oil'),
+    ('Riga–Reval',           'Riga',      'Reval',           200,  2, 'Salt/Skins/Grain Baltic'),
+    ('Reval–Novgorod',       'Reval',     'Novgorod',        280,  2, 'Skins/Timber east'),
+    ('London–Scarborough',   'London',    'Scarborough',     300,  3, 'Cloth/Wool/Beer British'),
+    ('Bergen–Scarborough',   'Bergen',    'Scarborough',     600,  5, 'Whale Oil to Britain'),
+    ('Visby–Gdansk',         'Visby',     'Gdansk',          220,  2, 'Cloth/Honey/Pottery'),
+    ('Visby–Lübeck',         'Visby',     'Lübeck',          420,  4, 'Cloth/Wool loop'),
+    ('Brugge–London',        'Brugge',    'London',          280,  2, 'Cloth/Salt/Spices'),
+    ('Cologne–Brugge',       'Cologne',   'Brugge',          240,  2, 'Wine/Honey Rhine'),
+    ('Venice–Genoa',         'Venice',    'Genoa',           500,  3, 'Silk/Glass/Wine'),
+    ('Genoa–Marseille',      'Genoa',     'Marseille',       280,  2, 'Spices/Olive Oil'),
+    ('Marseille–Barcelona',  'Marseille', 'Barcelona',       400,  3, 'Wine/Cloth/Spices'),
+    ('Barcelona–Lisbon',     'Barcelona', 'Lisbon',          800,  6, 'Atlantic gateway'),
+    ('Venice–Constantinople','Venice',    'Constantinople', 1400,  9, 'Silk/Spices luxury run'),
+    ('Genoa–Tunis',          'Genoa',     'Tunis',           600,  4, 'Spices/Leather/Ivory'),
+    ('Marseille–Naples',     'Marseille', 'Naples',          600,  4, 'Olive Oil/Wine south'),
+    ('Naples–Palermo',       'Naples',    'Palermo',         280,  2, 'Grain/Salt Sicily'),
+    ('Genoa–Alexandria',     'Genoa',     'Alexandria',     1800, 12, 'Cotton/Ivory/Dates far east'),
+    ('Lisbon–London',        'Lisbon',    'London',         1200,  8, 'Connects Med to Hanse')
 ON CONFLICT DO NOTHING;
 SQL
     success "Routes seeded (20 Hanseatic + 10 Mediterranean)."
 }
 
-# ── Building types ────────────────────────────────────────────────────────
 p3_seed_building_types() {
-    info "Seeding building types (daily production + daily maintenance)…"
+    info "Seeding building types…"
     p3_psql <<'SQL'
 INSERT INTO p3_building_types
     (name, output_good_id, input_good_id, input_units_per_output,
@@ -951,34 +1057,31 @@ INSERT INTO p3_building_types
 SELECT bt.name, g_out.good_id, g_in.good_id,
        bt.input_u, bt.prod, bt.cost, bt.maint, bt.notes
 FROM (VALUES
--- ── Patrician III buildings ───────────────────────────────────────────────
--- name                       out_good      in_good   input_u   prod    cost    maint/day  notes
- ('Grain Farm',       'Grain',      NULL,         0.000, 0.233,  5000,  25.67, 'Raw — Hamburg/Gdansk/Stettin'),
- ('Hemp Farm',        'Hemp',       NULL,         0.000, 0.058,  4000,  25.67, 'Raw — Brugge/Groningen/Hamburg'),
- ('Sheep Farm',       'Wool',       NULL,         0.000, 0.117,  6000, 112.00, 'Raw — London/Scarborough/Malmö'),
- ('Apiary',           'Honey',      NULL,         0.000, 0.467,  3000,  49.00, 'Raw — Cologne/Rostock/Torun'),
- ('Vineyard',         'Wine',       NULL,         0.000, 0.467,  8000,  98.00, 'Raw — Cologne best; Med even better'),
- ('Sawmill',          'Timber',     NULL,         0.000, 0.467,  2500,  28.00, 'Raw — Oslo/Novgorod/Stockholm'),
- ('Iron Smelter',     'Pig Iron',   NULL,         0.000, 0.117, 10000, 112.00, 'Raw — Oslo/London/Ladoga'),
- ('Saltworks',        'Salt',       NULL,         0.000, 1.167,  4000,  30.33, 'Raw — Ripen/Riga/Reval. Very high output'),
- ('Pottery Workshop', 'Pottery',    NULL,         0.000, 0.467,  5000,  84.00, 'Finished — Cologne/Rostock/Visby'),
- ('Pitchmaker',       'Pitch',      NULL,         0.000, 0.233,  2000,  12.83, 'Finished — Oslo/Bergen/Novgorod'),
- ('Brickworks',       'Bricks',     NULL,         0.000, 0.233,  2000,  12.83, 'Finished — Bremen/Groningen/Lübeck'),
- ('Hunting Lodge',    'Skins',      NULL,         0.000, 0.233,  7000, 168.00, 'Raw — Riga/Reval/Novgorod/Ladoga'),
- ('Cattle Farm',      'Meat',       NULL,         0.000, 0.058, 10000, 114.33, 'Raw — London/Aalborg/Malmö. Slow, high value'),
- ('Fishery',          'Fish',       'Salt',       0.050, 0.233,  6000,  84.00, 'Needs Salt — Hamburg/Edinburgh/Lübeck'),
- ('Whaling Station',  'Whale Oil',  NULL,         0.000, 0.933,  8000, 140.00, 'Finished — Ripen/Bergen/Oslo/Aalborg'),
- ('Brewery',          'Beer',       'Grain',      0.140, 1.633,  8000,  60.67, 'Grain→Beer — Hamburg/Gdansk/Bremen. Highest output'),
- ('Weaving Mill',     'Cloth',      'Wool',       0.100, 0.700,  9000, 102.67, 'Wool→Cloth — London/Scarborough/Malmö'),
- ('Iron Goods Workshop','Iron Goods','Pig Iron',  0.500, 0.700, 12000, 121.33, 'Pig Iron→Iron Goods — Lübeck/Bremen/Reval. Best margin'),
--- ── Patrician IV Mediterranean buildings ─────────────────────────────────
- ('Olive Grove',      'Olive Oil',  NULL,         0.000, 0.350,  6000,  45.00, 'P4 — Venice/Genoa/Marseille/Naples'),
- ('Winery (Med)',     'Wine',       NULL,         0.000, 0.583,  8000,  98.00, 'P4 — higher output than Rhine vineyard'),
- ('Silk Workshop',    'Silk',       NULL,         0.000, 0.117, 15000, 280.00, 'P4 — top-tier luxury; Constantinople best'),
- ('Spice Warehouse',  'Spices',     NULL,         0.000, 0.150, 12000, 200.00, 'P4 — redistributes imported spices'),
- ('Glassworks',       'Glass',      'Sand',       0.200, 0.280,  9000, 120.00, 'P4 — Venice specialty; needs Sand input'),
- ('Cotton Gin',       'Cotton',     NULL,         0.000, 0.400,  5000,  55.00, 'P4 — Barcelona/Alexandria/Palermo'),
- ('Alum Works',       'Alum',       NULL,         0.000, 0.240,  8000,  90.00, 'P4 — Constantinople/Genoa; dyeing agent')
+    ('Grain Farm',          'Grain',      NULL,        0.000, 0.233,  5000,  25.67, 'Raw'),
+    ('Hemp Farm',           'Hemp',       NULL,        0.000, 0.058,  4000,  25.67, 'Raw'),
+    ('Sheep Farm',          'Wool',       NULL,        0.000, 0.117,  6000, 112.00, 'Raw'),
+    ('Apiary',              'Honey',      NULL,        0.000, 0.467,  3000,  49.00, 'Raw'),
+    ('Vineyard',            'Wine',       NULL,        0.000, 0.467,  8000,  98.00, 'Raw'),
+    ('Sawmill',             'Timber',     NULL,        0.000, 0.467,  2500,  28.00, 'Raw'),
+    ('Iron Smelter',        'Pig Iron',   NULL,        0.000, 0.117, 10000, 112.00, 'Raw'),
+    ('Saltworks',           'Salt',       NULL,        0.000, 1.167,  4000,  30.33, 'Raw. Very high output'),
+    ('Pottery Workshop',    'Pottery',    NULL,        0.000, 0.467,  5000,  84.00, 'Finished'),
+    ('Pitchmaker',          'Pitch',      NULL,        0.000, 0.233,  2000,  12.83, 'Finished'),
+    ('Brickworks',          'Bricks',     NULL,        0.000, 0.233,  2000,  12.83, 'Finished'),
+    ('Hunting Lodge',       'Skins',      NULL,        0.000, 0.233,  7000, 168.00, 'Raw'),
+    ('Cattle Farm',         'Meat',       NULL,        0.000, 0.058, 10000, 114.33, 'Raw. Slow, high value'),
+    ('Fishery',             'Fish',       'Salt',      0.050, 0.233,  6000,  84.00, 'Needs Salt'),
+    ('Whaling Station',     'Whale Oil',  NULL,        0.000, 0.933,  8000, 140.00, 'Finished'),
+    ('Brewery',             'Beer',       'Grain',     0.140, 1.633,  8000,  60.67, 'Grain→Beer. Highest output'),
+    ('Weaving Mill',        'Cloth',      'Wool',      0.100, 0.700,  9000, 102.67, 'Wool→Cloth'),
+    ('Iron Goods Workshop', 'Iron Goods', 'Pig Iron',  0.500, 0.700, 12000, 121.33, 'Best margin'),
+    ('Olive Grove',         'Olive Oil',  NULL,        0.000, 0.350,  6000,  45.00, 'P4 Med'),
+    ('Winery (Med)',        'Wine',       NULL,        0.000, 0.583,  8000,  98.00, 'P4 Med'),
+    ('Silk Workshop',       'Silk',       NULL,        0.000, 0.117, 15000, 280.00, 'P4 top-tier luxury'),
+    ('Spice Warehouse',     'Spices',     NULL,        0.000, 0.150, 12000, 200.00, 'P4 redistribution'),
+    ('Glassworks',          'Glass',      'Sand',      0.200, 0.280,  9000, 120.00, 'P4 Venice specialty'),
+    ('Cotton Gin',          'Cotton',     NULL,        0.000, 0.400,  5000,  55.00, 'P4'),
+    ('Alum Works',          'Alum',       NULL,        0.000, 0.240,  8000,  90.00, 'P4 dyeing agent')
 ) AS bt(name, out_good, in_good, input_u, prod, cost, maint, notes)
 JOIN p3_goods g_out ON g_out.name = bt.out_good
 LEFT JOIN p3_goods g_in ON g_in.name = bt.in_good
@@ -988,10 +1091,9 @@ ON CONFLICT (name) DO UPDATE SET
     daily_maintenance = EXCLUDED.daily_maintenance,
     notes             = EXCLUDED.notes;
 SQL
-    success "Building types seeded (18 P3 + 6 P4 = 24 total)."
+    success "Building types seeded (18 P3 + 7 P4 = 25 total)."
 }
 
-# ── Elasticity ────────────────────────────────────────────────────────────
 p3_seed_elasticity() {
     info "Seeding marginal price elasticity…"
     p3_psql <<'SQL'
@@ -999,58 +1101,33 @@ INSERT INTO p3_good_elasticity
     (good_id, elasticity_buy, elasticity_sell, stock_ref, price_floor_pct, price_ceil_pct)
 SELECT g.good_id,
        CASE g.name
-           WHEN 'Ivory'      THEN 0.75
-           WHEN 'Silk'       THEN 0.70
-           WHEN 'Skins'      THEN 0.65
-           WHEN 'Spices'     THEN 0.60
-           WHEN 'Wool'       THEN 0.55
-           WHEN 'Cloth'      THEN 0.55
-           WHEN 'Iron Goods' THEN 0.50
-           WHEN 'Meat'       THEN 0.50
-           WHEN 'Glass'      THEN 0.48
-           WHEN 'Olive Oil'  THEN 0.45
-           WHEN 'Whale Oil'  THEN 0.45
-           WHEN 'Pig Iron'   THEN 0.45
-           WHEN 'Wine'       THEN 0.45
-           WHEN 'Alum'       THEN 0.42
-           WHEN 'Cotton'     THEN 0.40
-           WHEN 'Honey'      THEN 0.40
-           WHEN 'Dates'      THEN 0.38
-           WHEN 'Pottery'    THEN 0.38
-           WHEN 'Hemp'       THEN 0.35
-           WHEN 'Leather'    THEN 0.35
-           WHEN 'Beer'       THEN 0.30
-           WHEN 'Fish'       THEN 0.30
-           WHEN 'Grain'      THEN 0.25
-           WHEN 'Timber'     THEN 0.25
-           WHEN 'Salt'       THEN 0.22
-           WHEN 'Bricks'     THEN 0.20
-           WHEN 'Pitch'      THEN 0.20
-           WHEN 'Sand'       THEN 0.10
+           WHEN 'Ivory'      THEN 0.75  WHEN 'Silk'       THEN 0.70
+           WHEN 'Skins'      THEN 0.65  WHEN 'Spices'     THEN 0.60
+           WHEN 'Wool'       THEN 0.55  WHEN 'Cloth'      THEN 0.55
+           WHEN 'Iron Goods' THEN 0.50  WHEN 'Meat'       THEN 0.50
+           WHEN 'Glass'      THEN 0.48  WHEN 'Olive Oil'  THEN 0.45
+           WHEN 'Whale Oil'  THEN 0.45  WHEN 'Pig Iron'   THEN 0.45
+           WHEN 'Wine'       THEN 0.45  WHEN 'Alum'       THEN 0.42
+           WHEN 'Cotton'     THEN 0.40  WHEN 'Honey'      THEN 0.40
+           WHEN 'Dates'      THEN 0.38  WHEN 'Pottery'    THEN 0.38
+           WHEN 'Hemp'       THEN 0.35  WHEN 'Leather'    THEN 0.35
+           WHEN 'Beer'       THEN 0.30  WHEN 'Fish'       THEN 0.30
+           WHEN 'Grain'      THEN 0.25  WHEN 'Timber'     THEN 0.25
+           WHEN 'Salt'       THEN 0.22  WHEN 'Bricks'     THEN 0.20
+           WHEN 'Pitch'      THEN 0.20  WHEN 'Sand'       THEN 0.10
            ELSE 0.35
        END AS elasticity_buy,
        CASE g.name
-           WHEN 'Ivory'      THEN 0.65
-           WHEN 'Silk'       THEN 0.60
-           WHEN 'Skins'      THEN 0.55
-           WHEN 'Spices'     THEN 0.50
-           WHEN 'Wool'       THEN 0.45
-           WHEN 'Cloth'      THEN 0.45
-           WHEN 'Iron Goods' THEN 0.40
-           WHEN 'Meat'       THEN 0.40
-           WHEN 'Glass'      THEN 0.38
-           WHEN 'Olive Oil'  THEN 0.35
-           WHEN 'Wine'       THEN 0.35
-           WHEN 'Beer'       THEN 0.22
-           WHEN 'Grain'      THEN 0.18
-           WHEN 'Salt'       THEN 0.15
-           WHEN 'Sand'       THEN 0.08
-           ELSE 0.28
+           WHEN 'Ivory'      THEN 0.65  WHEN 'Silk'       THEN 0.60
+           WHEN 'Skins'      THEN 0.55  WHEN 'Spices'     THEN 0.50
+           WHEN 'Wool'       THEN 0.45  WHEN 'Cloth'      THEN 0.45
+           WHEN 'Iron Goods' THEN 0.40  WHEN 'Meat'       THEN 0.40
+           WHEN 'Glass'      THEN 0.38  WHEN 'Olive Oil'  THEN 0.35
+           WHEN 'Wine'       THEN 0.35  WHEN 'Beer'       THEN 0.22
+           WHEN 'Grain'      THEN 0.18  WHEN 'Salt'       THEN 0.15
+           WHEN 'Sand'       THEN 0.08  ELSE 0.28
        END AS elasticity_sell,
-       CASE
-           WHEN g.is_raw_material THEN 120
-           ELSE 80
-       END AS stock_ref,
+       CASE WHEN g.is_raw_material THEN 120 ELSE 80 END AS stock_ref,
        0.30 AS price_floor_pct,
        3.50 AS price_ceil_pct
 FROM p3_goods g
@@ -1062,76 +1139,44 @@ SQL
     success "Elasticity seeded for all 28 goods."
 }
 
-# ── Hex city placement (POINTY-TOP) ──────────────────────────────────────
 p3_seed_hex_cities() {
     info "Placing cities on pointy-top hex grid…"
     p3_psql <<'SQL'
--- =============================================================================
---  POINTY-TOP AXIAL COORDINATES  (q, r)
---  Reference: https://www.redblobgames.com/grids/hexagons/implementation.html
---
---  Origin: Lübeck (0, 0)  — 53.8655°N, 10.6866°E
---  Scale:  1 hex ≈ 50 nautical miles
---
---  Conversion from geographic coordinates:
---    At 54°N:  1° lon ≈ 35.38 nm  →  50 nm / 35.38 nm/° = 1.413°/hex (E–W)
---              1° lat ≈ 60.00 nm  →  50 nm / 60.00 nm/° = 0.833°/hex (N–S)
---    q = ROUND( (lon - 10.687) / 1.413 )    — positive q = east
---    r = ROUND( (53.866 - lat) / 0.833 )    — positive r = south
---
---  City coordinates verified against actual lat/lon.
---  Hamburg (53.55°N, 10.00°E) rounds to the same hex as Lübeck at 50nm scale
---  (they are only 65 km / 35 nm apart), so Hamburg is placed at (-1, 0),
---  one hex due west — geographically accurate for a terminal separation.
---
---  Neighbour directions (pointy-top, for reference):
---    (+1, 0)  E    (+1,-1) NE    (0,-1) NW
---    (-1, 0)  W    (-1,+1) SW    (0,+1) SE
--- =============================================================================
 WITH city_coords(city_name, q, r) AS (VALUES
-    -- ── Hanseatic Baltic ─────────────────────────────────────────────────
-    --                         q    r     lat      lon
-    ('Lübeck',                 0,   0),  -- 53.87N  10.69E  origin
-    ('Hamburg',               -1,   0),  -- 53.55N  10.00E  35nm W of Lübeck; manual offset
-    ('Rostock',                1,   0),  -- 54.09N  12.14E
-    ('Stettin',                3,   1),  -- 53.43N  14.55E
-    ('Gdansk',                 6,  -1),  -- 54.35N  18.65E
-    ('Riga',                   9,  -4),  -- 56.95N  24.11E
-    ('Reval',                 10,  -7),  -- 59.44N  24.75E  (Tallinn)
-    ('Novgorod',              15,  -6),  -- 58.53N  31.28E
-    ('Stockholm',              5,  -7),  -- 59.33N  18.07E
-    ('Visby',                  5,  -5),  -- 57.63N  18.29E
-    ('Malmö',                  2,  -2),  -- 55.61N  13.00E
-    -- ── Scandinavia & North Sea ──────────────────────────────────────────
-    ('Bergen',                -4,  -8),  -- 60.39N   5.32E
-    ('Oslo',                   0,  -7),  -- 59.91N  10.75E
-    ('Aalborg',               -1,  -4),  -- 57.05N   9.92E
-    ('Ripen',                 -1,  -2),  -- 55.34N   9.79E  (Ribe)
-    -- ── British Isles ────────────────────────────────────────────────────
-    ('Scarborough',           -8,   0),  -- 54.28N  -0.40E
-    ('Edinburgh',            -10,  -3),  -- 55.95N  -3.19E
-    ('London',                -8,   3),  -- 51.51N  -0.13E
-    -- ── Rhine & Low Countries ────────────────────────────────────────────
-    ('Brugge',                -5,   3),  -- 51.21N   3.22E
-    ('Groningen',             -3,   1),  -- 53.22N   6.57E
-    ('Bremen',                -1,   1),  -- 53.08N   8.80E
-    ('Cologne',               -3,   4),  -- 50.93N   6.95E
-    -- ── Eastern Baltic ───────────────────────────────────────────────────
-    ('Torun',                  6,   1),  -- 53.01N  18.61E
-    ('Ladoga',                15,  -7),  -- 60.00N  32.30E
-    -- ── Mediterranean (P4) ───────────────────────────────────────────────
-    --  These share the same coordinate space as the Hanseatic map,
-    --  falling naturally below (positive r = south) and slightly east/west.
-    ('Venice',                 1,  10),  -- 45.44N  12.32E
-    ('Genoa',                 -1,  11),  -- 44.41N   8.95E
-    ('Marseille',             -4,  13),  -- 43.30N   5.37E
-    ('Barcelona',             -6,  15),  -- 41.39N   2.17E
-    ('Lisbon',               -14,  18),  -- 38.72N  -9.14E
-    ('Constantinople',        13,  15),  -- 41.01N  28.98E
-    ('Naples',                 3,  16),  -- 40.85N  14.27E
-    ('Palermo',                2,  19),  -- 38.12N  13.36E
-    ('Tunis',                  0,  20),  -- 36.81N  10.18E
-    ('Alexandria',            14,  27)   -- 31.20N  29.92E
+    ('Lübeck',                 0,   0),
+    ('Hamburg',               -1,   0),
+    ('Rostock',                1,   0),
+    ('Stettin',                3,   1),
+    ('Gdansk',                 6,  -1),
+    ('Riga',                   9,  -4),
+    ('Reval',                 10,  -7),
+    ('Novgorod',              15,  -6),
+    ('Stockholm',              5,  -7),
+    ('Visby',                  5,  -5),
+    ('Malmö',                  2,  -2),
+    ('Bergen',                -4,  -8),
+    ('Oslo',                   0,  -7),
+    ('Aalborg',               -1,  -4),
+    ('Ripen',                 -1,  -2),
+    ('Scarborough',           -8,   0),
+    ('Edinburgh',            -10,  -3),
+    ('London',                -8,   3),
+    ('Brugge',                -5,   3),
+    ('Groningen',             -3,   1),
+    ('Bremen',                -1,   1),
+    ('Cologne',               -3,   4),
+    ('Torun',                  6,   1),
+    ('Ladoga',                15,  -7),
+    ('Venice',                 1,  10),
+    ('Genoa',                 -1,  11),
+    ('Marseille',             -4,  13),
+    ('Barcelona',             -6,  15),
+    ('Lisbon',               -14,  18),
+    ('Constantinople',        13,  15),
+    ('Naples',                 3,  16),
+    ('Palermo',                2,  19),
+    ('Tunis',                  0,  20),
+    ('Alexandria',            14,  27)
 )
 UPDATE p3_cities ci
 SET    hex_q = cc.q,
@@ -1139,7 +1184,6 @@ SET    hex_q = cc.q,
 FROM   city_coords cc
 WHERE  ci.name = cc.city_name;
 
--- Create hex tiles for each placed city
 INSERT INTO p3_hex_tiles (q, r, terrain, city_id)
 SELECT ci.hex_q, ci.hex_r,
        CASE
@@ -1155,17 +1199,16 @@ ON CONFLICT (q, r) DO UPDATE
     SET city_id = EXCLUDED.city_id,
         terrain  = EXCLUDED.terrain;
 SQL
-    success "Cities placed on pointy-top hex grid (24 Baltic + 10 Mediterranean)."
+    success "Cities placed on hex grid (24 Baltic + 10 Mediterranean)."
 }
 
-# ── Player + starting ship ────────────────────────────────────────────────
 p3_seed_player() {
     local cnt
     cnt=$(p3_psql --tuples-only -c "SELECT COUNT(*) FROM p3_player;" | tr -d ' ')
     if [[ "$cnt" == "0" ]]; then
-        p3_psql -c "INSERT INTO p3_player (name, home_city, gold, rank, game_year, game_day)
-                    VALUES ('Merchant', 'Lübeck', 2000, 'Apprentice', 1300, 1);"
-        success "Player created — 2 000 gold, home city Lübeck, Year 1300 Day 1."
+        p3_psql -c "INSERT INTO p3_player (name, home_city, gold, rank, game_year, game_day, is_admin)
+                    VALUES ('Merchant', 'Lübeck', 2000, 'Apprentice', 1300, 1, FALSE);"
+        success "Player created — 2 000 gold, Lübeck, Year 1300 Day 1."
     else
         info "Player already exists."
     fi
@@ -1182,45 +1225,114 @@ p3_seed_starting_ship() {
     fi
 }
 
-# ── Drop all tables / views / functions (hard reset) ─────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14b-NPC  NPC FLEET SEED
+# ─────────────────────────────────────────────────────────────────────────────
+p3_npc_seed_fleet() {
+    info "Seeding NPC factions and merchant fleet…"
+    p3_psql <<'SQL'
+INSERT INTO p3_npc_factions (name, home_city, description) VALUES
+    ('Stralsund Brotherhood',  'Rostock',   'Baltic grain and timber traders'),
+    ('Bergen Cod Company',     'Bergen',    'North Sea fish and whale oil merchants'),
+    ('Rhine Vintners Guild',   'Cologne',   'Wine and honey specialists'),
+    ('London Wool Staple',     'London',    'Wool and cloth exporters'),
+    ('Novgorod Fur Company',   'Novgorod',  'Eastern fur and skins traders'),
+    ('Venice Silk House',      'Venice',    'Mediterranean luxury good merchants')
+ON CONFLICT (name) DO NOTHING;
+
+WITH inserted AS (
+    INSERT INTO p3_ships (name, owner, ship_type, cargo_cap, speed_knots, current_city, status)
+    VALUES
+        ('Greifswald Star',    'npc', 'Crayer',  80, 7.0, 'Gdansk',        'docked'),
+        ('Wismar Bell',        'npc', 'Hulk',   160, 4.0, 'Hamburg',       'docked'),
+        ('Rostock Hawk',       'npc', 'Crayer',  80, 7.0, 'Lübeck',        'docked'),
+        ('Aalborg Fisher',     'npc', 'Crayer',  80, 7.0, 'Bergen',        'docked'),
+        ('Novgorod Bear',      'npc', 'Hulk',   160, 4.0, 'Novgorod',      'docked'),
+        ('Scarborough Fleece', 'npc', 'Crayer',  80, 7.0, 'London',        'docked'),
+        ('Rhine Eagle',        'npc', 'Crayer',  80, 7.0, 'Cologne',       'docked'),
+        ('Ladoga Trapper',     'npc', 'Snaikka', 50, 5.0, 'Ladoga',        'docked'),
+        ('Riga Salt Runner',   'npc', 'Crayer',  80, 7.0, 'Riga',          'docked'),
+        ('Stockholm Smith',    'npc', 'Crayer',  80, 7.0, 'Stockholm',     'docked'),
+        ('Serenissima',        'npc', 'Carrack',220, 5.5, 'Venice',        'docked'),
+        ('Genoa Merchant',     'npc', 'Cog',    120, 6.0, 'Genoa',         'docked'),
+        ('Golden Horn',        'npc', 'Galley',  90, 9.0, 'Constantinople','docked')
+    RETURNING ship_id, name, current_city
+)
+INSERT INTO p3_npc_ships (npc_ship_id, good_id, home_city)
+SELECT i.ship_id, g.good_id, i.current_city
+FROM inserted i
+JOIN p3_goods g ON g.name = CASE i.name
+    WHEN 'Greifswald Star'    THEN 'Grain'
+    WHEN 'Wismar Bell'        THEN 'Timber'
+    WHEN 'Rostock Hawk'       THEN 'Beer'
+    WHEN 'Aalborg Fisher'     THEN 'Fish'
+    WHEN 'Novgorod Bear'      THEN 'Skins'
+    WHEN 'Scarborough Fleece' THEN 'Wool'
+    WHEN 'Rhine Eagle'        THEN 'Wine'
+    WHEN 'Ladoga Trapper'     THEN 'Pig Iron'
+    WHEN 'Riga Salt Runner'   THEN 'Salt'
+    WHEN 'Stockholm Smith'    THEN 'Iron Goods'
+    WHEN 'Serenissima'        THEN 'Silk'
+    WHEN 'Genoa Merchant'     THEN 'Olive Oil'
+    WHEN 'Golden Horn'        THEN 'Spices'
+END
+ON CONFLICT (npc_ship_id) DO NOTHING;
+SQL
+    success "NPC fleet seeded (13 ships across Hanseatic + Mediterranean routes)."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DROP / RESET
+# ─────────────────────────────────────────────────────────────────────────────
 p3_drop_tables() {
     info "Dropping all Patrician III + IV objects…"
     p3_psql <<'SQL'
--- Views first (depend on tables)
-DROP VIEW IF EXISTS p3_arbitrage_view CASCADE;
-DROP VIEW IF EXISTS p3_market_view    CASCADE;
-DROP VIEW IF EXISTS p3_fleet_view     CASCADE;
+-- Views
+DROP VIEW IF EXISTS p3_npc_fleet_summary        CASCADE;
+DROP VIEW IF EXISTS p3_visible_npc_ships        CASCADE;
+DROP VIEW IF EXISTS p3_admin_crossleague_view   CASCADE;
+DROP VIEW IF EXISTS p3_admin_arbitrage_view     CASCADE;
+DROP VIEW IF EXISTS p3_lubeck_market_view       CASCADE;
+DROP VIEW IF EXISTS p3_visible_market_view      CASCADE;
+DROP VIEW IF EXISTS p3_market_view              CASCADE;
+DROP VIEW IF EXISTS p3_fleet_view               CASCADE;
 
 -- Functions
-DROP FUNCTION IF EXISTS p3_marginal_price(INT,INT,TEXT,INT,INT) CASCADE;
-DROP FUNCTION IF EXISTS p3_travel_days(INT,INT,NUMERIC)         CASCADE;
-DROP FUNCTION IF EXISTS p3_hex_neighbors(INT,INT)               CASCADE;
-DROP FUNCTION IF EXISTS p3_hex_distance(INT,INT,INT,INT)        CASCADE;
+DROP FUNCTION IF EXISTS p3_notify_tick()                          CASCADE;
+DROP FUNCTION IF EXISTS p3_marginal_price(INT,INT,TEXT,INT,INT)   CASCADE;
+DROP FUNCTION IF EXISTS p3_player_visible_city_ids()              CASCADE;
+DROP FUNCTION IF EXISTS p3_counting_house_cost(TEXT)              CASCADE;
+DROP FUNCTION IF EXISTS p3_travel_days(INT,INT,NUMERIC)           CASCADE;
+DROP FUNCTION IF EXISTS p3_hex_neighbors(INT,INT)                 CASCADE;
+DROP FUNCTION IF EXISTS p3_hex_distance(INT,INT,INT,INT)          CASCADE;
 
--- Tables in reverse-FK order (CASCADE handles any stragglers)
-DROP TABLE IF EXISTS p3_trade_log        CASCADE;
-DROP TABLE IF EXISTS p3_limit_orders     CASCADE;
-DROP TABLE IF EXISTS p3_ship_orders      CASCADE;
-DROP TABLE IF EXISTS p3_ship_routes      CASCADE;
-DROP TABLE IF EXISTS p3_route_orders     CASCADE;
-DROP TABLE IF EXISTS p3_routes           CASCADE;
-DROP TABLE IF EXISTS p3_cargo            CASCADE;
-DROP TABLE IF EXISTS p3_ships            CASCADE;
-DROP TABLE IF EXISTS p3_player_buildings CASCADE;
-DROP TABLE IF EXISTS p3_building_types   CASCADE;
-DROP TABLE IF EXISTS p3_price_history    CASCADE;
-DROP TABLE IF EXISTS p3_market           CASCADE;
-DROP TABLE IF EXISTS p3_city_goods       CASCADE;
-DROP TABLE IF EXISTS p3_hex_tiles        CASCADE;
-DROP TABLE IF EXISTS p3_good_elasticity  CASCADE;
-DROP TABLE IF EXISTS p3_cities           CASCADE;
-DROP TABLE IF EXISTS p3_goods            CASCADE;
-DROP TABLE IF EXISTS p3_player           CASCADE;
+-- Tables (reverse FK order)
+DROP TABLE IF EXISTS p3_npc_trade_log        CASCADE;
+DROP TABLE IF EXISTS p3_npc_ships            CASCADE;
+DROP TABLE IF EXISTS p3_npc_factions         CASCADE;
+DROP TABLE IF EXISTS p3_counting_houses      CASCADE;
+DROP TABLE IF EXISTS p3_trade_log            CASCADE;
+DROP TABLE IF EXISTS p3_limit_orders         CASCADE;
+DROP TABLE IF EXISTS p3_ship_orders          CASCADE;
+DROP TABLE IF EXISTS p3_ship_routes          CASCADE;
+DROP TABLE IF EXISTS p3_route_orders         CASCADE;
+DROP TABLE IF EXISTS p3_routes               CASCADE;
+DROP TABLE IF EXISTS p3_cargo                CASCADE;
+DROP TABLE IF EXISTS p3_ships                CASCADE;
+DROP TABLE IF EXISTS p3_player_buildings     CASCADE;
+DROP TABLE IF EXISTS p3_building_types       CASCADE;
+DROP TABLE IF EXISTS p3_price_history        CASCADE;
+DROP TABLE IF EXISTS p3_market               CASCADE;
+DROP TABLE IF EXISTS p3_city_goods           CASCADE;
+DROP TABLE IF EXISTS p3_hex_tiles            CASCADE;
+DROP TABLE IF EXISTS p3_good_elasticity      CASCADE;
+DROP TABLE IF EXISTS p3_cities               CASCADE;
+DROP TABLE IF EXISTS p3_goods                CASCADE;
+DROP TABLE IF EXISTS p3_player               CASCADE;
 SQL
     success "All Patrician objects dropped."
 }
 
-# ── Full setup ────────────────────────────────────────────────────────────
 p3_setup_all() {
     p3_drop_tables
     p3_create_tables
@@ -1236,22 +1348,23 @@ p3_setup_all() {
     p3_seed_hex_cities
     p3_seed_player
     p3_seed_starting_ship
+    p3_npc_seed_fleet
     echo
     success "✅  Patrician III + IV fully initialised!"
     info    "    Hanseatic cities: 24  |  Mediterranean cities: 10"
-    info    "    Goods: 28 (20 Hanse + 8 Med)  |  Building types: 24"
-    info    "    Hex system: pointy-top axial, 1 hex ≈ 50 nm, origin Lübeck (0,0)"
-    info    "    Ship types: Snaikka(50,5kn) Crayer(80,7kn) Hulk(160,4kn)"
-    info    "                Cog(120,6kn) Galley(90,9kn) Carrack(220,5.5kn)"
-    info    "    Starting: 2000 gold, ship 'Henrietta' in Lübeck, Year 1300 Day 1"
+    info    "    Goods: 28  |  Building types: 25  |  NPC ships: 13"
+    info    "    Hex: pointy-top axial, 1 hex ≈ 50 nm, origin Lübeck (0,0)"
+    info    "    Starting: 2 000 gold · ship 'Henrietta' · Year 1300 Day 1"
+    info    "    Fog of war: ON — sail to cities to reveal market prices"
+    info    "    Admin mode: UPDATE p3_player SET is_admin = TRUE;"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14c  ADVANCE DAY  (replaces p3_advance_month)
+#  §14c  ADVANCE DAY
 # ─────────────────────────────────────────────────────────────────────────────
 p3_advance_day() {
 
-    # 1. Tick ships — 1 day per call
+    # 1. Tick ships
     p3_psql -c "
         UPDATE p3_ships SET eta_days = eta_days - 1
         WHERE  status = 'sailing' AND eta_days > 0;
@@ -1262,7 +1375,7 @@ p3_advance_day() {
         WHERE  status = 'sailing' AND eta_days <= 0;
     " >/dev/null
 
-    # 2. Log arrivals (once per ship per day)
+    # 2. Log arrivals
     p3_psql -c "
         INSERT INTO p3_trade_log
             (game_year, game_day, ship_id, ship_name, city, action, logged_at)
@@ -1277,7 +1390,6 @@ p3_advance_day() {
     " >/dev/null 2>&1 || true
 
     # 3. Daily production
-    #    base_production = units/day; efficiency scales it; 0.17% daily consumption
     p3_psql -c "
         UPDATE p3_market m
         SET    stock = LEAST(500,
@@ -1298,7 +1410,7 @@ p3_advance_day() {
         );
     " >/dev/null
 
-    # 4. Daily price tick — 1/30th of monthly pressure, per-unit elasticity preserved
+    # 4. Daily price tick
     p3_psql -c "
         UPDATE p3_market m
         SET current_sell = GREATEST(1::NUMERIC, ROUND(new_mid * 0.92, 2)),
@@ -1374,6 +1486,9 @@ p3_advance_day() {
 
     # 6.5. Buildings + limit orders
     p3_process_production_and_orders_daily
+
+    # 6.6. NPC ship AI
+    p3_npc_tick
 
     # 7. Advance calendar
     p3_psql -c "
@@ -1483,7 +1598,7 @@ SQL
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14d  SAIL ORDER  (speed-aware ETA)
+#  §14d  SAIL ORDER
 # ─────────────────────────────────────────────────────────────────────────────
 p3_sail_ship() {
     local sid="$1" dest="$2"
@@ -1495,7 +1610,6 @@ p3_sail_ship() {
 
     [[ "$status" != "docked" ]] && { error "$scity ship is $status."; return 1; }
 
-    # ETA = distance_nm / (speed_knots * 24)  — faster ships arrive sooner
     local eta
     eta=$(p3_psql --tuples-only -c "
         SELECT GREATEST(1, ROUND(distance_nm::NUMERIC / ($spd * 24.0))::INTEGER)
@@ -1504,7 +1618,6 @@ p3_sail_ship() {
            OR (city_b = '$scity' AND city_a = '$dest')
         ORDER BY distance_nm LIMIT 1;" | tr -d ' ')
 
-    # Fallback to hex distance if no route defined
     if [[ -z "$eta" || "$eta" == "0" ]]; then
         eta=$(p3_psql --tuples-only -c "
             SELECT COALESCE(p3_travel_days(
@@ -1527,7 +1640,7 @@ p3_sail_ship() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14e  BUY  (per-unit marginal pricing)
+#  §14e  BUY
 # ─────────────────────────────────────────────────────────────────────────────
 p3_do_buy() {
     local sid="$1" good="$2" qty="$3" scity="$4"
@@ -1557,7 +1670,6 @@ p3_do_buy() {
         IF v_stock < $qty THEN RAISE EXCEPTION 'Not enough stock (have %, need %)', v_stock, $qty; END IF;
         IF v_free  < $qty THEN RAISE EXCEPTION 'Not enough cargo (free %, need %)', v_free,  $qty; END IF;
 
-        -- Per-unit marginal cost loop
         v_total := 0;
         FOR i IN 0..($qty-1) LOOP
             unit_price := p3_marginal_price(v_cid, v_gid, 'buy', i,
@@ -1601,7 +1713,7 @@ p3_do_buy() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14f  SELL  (per-unit marginal pricing)
+#  §14f  SELL
 # ─────────────────────────────────────────────────────────────────────────────
 p3_do_sell() {
     local sid="$1" good="$2" qty="$3" scity="$4"
@@ -1631,7 +1743,6 @@ p3_do_sell() {
             RAISE EXCEPTION 'Not enough cargo (have %, need %)', COALESCE(v_aboard, 0), $qty;
         END IF;
 
-        -- Per-unit marginal revenue loop
         v_total := 0;
         FOR i IN 0..($qty-1) LOOP
             unit_price := p3_marginal_price(v_cid, v_gid, 'sell', i,
@@ -1671,38 +1782,193 @@ p3_do_sell() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14m  REAL-TIME TICK DAEMON  (pg_notify + LISTEN integration)
+#  §14g  NPC SHIP AI TICK
 #
-#  Architecture:
-#    _p3_tick_loop   — background bash loop; advances one game day every
-#                      P3_TICK_INTERVAL seconds, then calls p3_notify_tick()
-#                      which fires pg_notify('p3_day_tick', json_payload).
-#    _p3_listen_loop — background psql LISTEN session; writes the JSON
-#                      payload of each notification to P3_TICK_STATE_FILE
-#                      so the dashboard can show the last-tick info without
-#                      an extra DB round-trip.
-#
-#  External monitoring:  psql -c "LISTEN p3_day_tick;"
-#                        (receives live JSON every simulated day)
+#  Called once per game day. Each NPC ship:
+#    · If docked and empty  → buy from the best surplus city for its good
+#    · If docked and loaded → sail to the best deficit city
+#    · If just arrived at sell target → sell cargo and update market
+#  NPC trades affect market prices identically to player trades.
+# ─────────────────────────────────────────────────────────────────────────────
+p3_npc_tick() {
+    p3_psql <<'NSQL' >/dev/null 2>&1
+DO $$
+DECLARE
+    npc         RECORD;
+    v_cargo     INTEGER;
+    v_best_buy  TEXT;
+    v_best_sell TEXT;
+    v_stock     INTEGER;
+    v_price_b   NUMERIC;
+    v_price_s   NUMERIC;
+    v_qty       INTEGER;
+    v_profit    NUMERIC;
+    v_eta       INTEGER;
+    v_cid_src   INTEGER;
+    v_cid_dst   INTEGER;
+    v_gday      INTEGER;
+    v_gyear     INTEGER;
+BEGIN
+    SELECT game_day, game_year INTO v_gday, v_gyear FROM p3_player LIMIT 1;
+
+    FOR npc IN
+        SELECT s.ship_id, s.name AS ship_name, s.current_city, s.status,
+               s.eta_days, s.cargo_cap, s.speed_knots, s.destination,
+               ns.good_id, ns.home_city, ns.ai_state,
+               ns.target_buy_city, ns.target_sell_city,
+               g.name AS good_name
+        FROM   p3_npc_ships ns
+        JOIN   p3_ships s ON s.ship_id = ns.npc_ship_id
+        JOIN   p3_goods g ON g.good_id = ns.good_id
+        WHERE  s.owner = 'npc'
+    LOOP
+        SELECT COALESCE(quantity, 0) INTO v_cargo
+        FROM   p3_cargo
+        WHERE  ship_id = npc.ship_id AND good_id = npc.good_id;
+        v_cargo := COALESCE(v_cargo, 0);
+
+        -- DOCKED, EMPTY: find best surplus city and buy
+        IF npc.status = 'docked' AND v_cargo = 0 THEN
+            SELECT ci.city_id, ci.name, m.stock, m.current_buy
+            INTO   v_cid_src, v_best_buy, v_stock, v_price_b
+            FROM   p3_market m
+            JOIN   p3_cities ci ON ci.city_id = m.city_id
+            JOIN   p3_city_goods cg ON cg.city_id = m.city_id
+                                    AND cg.good_id = npc.good_id
+                                    AND cg.role = 'produces'
+            WHERE  m.good_id = npc.good_id
+              AND  m.stock   > 20
+              AND  ci.name  <> npc.current_city
+            ORDER  BY m.stock DESC, m.current_buy ASC
+            LIMIT  1;
+
+            IF v_best_buy IS NOT NULL THEN
+                v_qty := LEAST(npc.cargo_cap, v_stock - 10);
+                IF v_qty > 0 THEN
+                    INSERT INTO p3_cargo (ship_id, good_id, quantity)
+                    VALUES (npc.ship_id, npc.good_id, v_qty)
+                    ON CONFLICT (ship_id, good_id)
+                    DO UPDATE SET quantity = p3_cargo.quantity + EXCLUDED.quantity;
+
+                    UPDATE p3_market
+                    SET    stock        = GREATEST(0, stock - v_qty),
+                           current_buy  = GREATEST(1, ROUND(current_buy  * (1.0 + (v_qty::NUMERIC / GREATEST(stock, 1)) * 0.05), 2)),
+                           current_sell = GREATEST(1, ROUND(current_sell * (1.0 + (v_qty::NUMERIC / GREATEST(stock, 1)) * 0.05), 2))
+                    WHERE  city_id = v_cid_src AND good_id = npc.good_id;
+
+                    UPDATE p3_npc_ships
+                    SET    ai_state = 'seeking', target_buy_city = v_best_buy
+                    WHERE  npc_ship_id = npc.ship_id;
+
+                    INSERT INTO p3_npc_trade_log
+                        (game_year, game_day, ship_id, ship_name, good_id, good_name,
+                         action, city, quantity, price)
+                    VALUES (v_gyear, v_gday, npc.ship_id, npc.ship_name, npc.good_id,
+                            npc.good_name, 'buy', npc.current_city, v_qty, v_price_b);
+                END IF;
+            END IF;
+
+        -- DOCKED, LOADED, NOT AT SELL TARGET: find best deficit city and sail
+        ELSIF npc.status = 'docked' AND v_cargo > 0
+              AND (npc.target_sell_city IS NULL OR npc.current_city <> npc.target_sell_city) THEN
+
+            SELECT m.city_id, ci.name, m.current_sell
+            INTO   v_cid_dst, v_best_sell, v_price_s
+            FROM   p3_market m
+            JOIN   p3_cities ci ON ci.city_id = m.city_id
+            WHERE  m.good_id = npc.good_id
+              AND  ci.name  <> npc.current_city
+              AND  m.stock   < 150
+            ORDER  BY m.current_sell DESC, m.stock ASC
+            LIMIT  1;
+
+            IF v_best_sell IS NOT NULL THEN
+                v_eta := GREATEST(1, ROUND(
+                    COALESCE(p3_travel_days(
+                        (SELECT city_id FROM p3_cities WHERE name = npc.current_city LIMIT 1),
+                        v_cid_dst,
+                        npc.speed_knots
+                    ), 5)
+                )::INTEGER);
+
+                UPDATE p3_ships
+                SET    status      = 'sailing',
+                       destination = v_best_sell,
+                       eta_days    = v_eta
+                WHERE  ship_id = npc.ship_id;
+
+                UPDATE p3_npc_ships
+                SET    ai_state = 'sailing', target_sell_city = v_best_sell
+                WHERE  npc_ship_id = npc.ship_id;
+
+                INSERT INTO p3_npc_trade_log
+                    (game_year, game_day, ship_id, ship_name, good_id, good_name,
+                     action, city, quantity)
+                VALUES (v_gyear, v_gday, npc.ship_id, npc.ship_name, npc.good_id,
+                        npc.good_name, 'depart', npc.current_city, v_cargo);
+            END IF;
+
+        -- DOCKED, LOADED, AT SELL TARGET: sell cargo
+        ELSIF npc.status = 'docked' AND v_cargo > 0
+              AND npc.target_sell_city IS NOT NULL
+              AND npc.current_city = npc.target_sell_city THEN
+
+            SELECT m.city_id, m.current_sell, m.stock
+            INTO   v_cid_dst, v_price_s, v_stock
+            FROM   p3_market m
+            JOIN   p3_cities ci ON ci.city_id = m.city_id AND ci.name = npc.current_city
+            WHERE  m.good_id = npc.good_id;
+
+            IF v_cid_dst IS NOT NULL THEN
+                UPDATE p3_market
+                SET    stock        = LEAST(500, stock + v_cargo),
+                       current_sell = GREATEST(1, ROUND(current_sell * (1.0 - (v_cargo::NUMERIC / GREATEST(stock + v_cargo, 1)) * 0.04), 2)),
+                       current_buy  = GREATEST(1, ROUND(current_buy  * (1.0 - (v_cargo::NUMERIC / GREATEST(stock + v_cargo, 1)) * 0.04), 2))
+                WHERE  city_id = v_cid_dst AND good_id = npc.good_id;
+
+                v_profit := v_price_s * v_cargo;
+
+                DELETE FROM p3_cargo
+                WHERE  ship_id = npc.ship_id AND good_id = npc.good_id;
+
+                UPDATE p3_npc_ships
+                SET    ai_state         = 'seeking',
+                       last_profit      = v_profit,
+                       total_profit     = total_profit + v_profit,
+                       trips_completed  = trips_completed + 1,
+                       target_sell_city = NULL
+                WHERE  npc_ship_id = npc.ship_id;
+
+                INSERT INTO p3_npc_trade_log
+                    (game_year, game_day, ship_id, ship_name, good_id, good_name,
+                     action, city, quantity, price, profit)
+                VALUES (v_gyear, v_gday, npc.ship_id, npc.ship_name, npc.good_id,
+                        npc.good_name, 'sell', npc.current_city, v_cargo, v_price_s, v_profit);
+            END IF;
+        END IF;
+
+    END LOOP;
+END $$;
+NSQL
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14h  REAL-TIME TICK DAEMON
 # ─────────────────────────────────────────────────────────────────────────────
 P3_TICK_PID_FILE="/tmp/p3_tick_${P3_DB:-traderdude}.pid"
 P3_LISTEN_PID_FILE="/tmp/p3_listen_${P3_DB:-traderdude}.pid"
 P3_TICK_STATE_FILE="/tmp/p3_tick_${P3_DB:-traderdude}.state"
-P3_TICK_INTERVAL="${P3_TICK_INTERVAL:-10}"    # seconds per simulated game day
+P3_TICK_INTERVAL="${P3_TICK_INTERVAL:-10}"
 
-# ── Internal: background loop that advances the day ──────────────────────
 _p3_tick_loop() {
     while true; do
         sleep "${P3_TICK_INTERVAL:-10}"
-        # Advance ships, production, prices, calendar — then notify
         p3_psql <<'TKSQL' >/dev/null 2>&1 || true
--- Ship movement
 UPDATE p3_ships SET eta_days = eta_days - 1
     WHERE status = 'sailing' AND eta_days > 0;
 UPDATE p3_ships
     SET status = 'docked', current_city = destination, destination = NULL, eta_days = 0
     WHERE status = 'sailing' AND eta_days <= 0;
--- Daily stock tick
 UPDATE p3_market m SET stock = LEAST(500, GREATEST(0,
     m.stock
     + COALESCE((SELECT FLOOR(g.base_production * cg.efficiency / 100.0)::INTEGER
@@ -1713,7 +1979,6 @@ UPDATE p3_market m SET stock = LEAST(500, GREATEST(0,
 WHERE m.stock > 0 OR EXISTS (
     SELECT 1 FROM p3_city_goods cg
     WHERE cg.city_id = m.city_id AND cg.good_id = m.good_id AND cg.role = 'produces');
--- Daily price tick
 UPDATE p3_market m
     SET current_sell = GREATEST(1, ROUND(e.new_mid * 0.92, 2)),
         current_buy  = GREATEST(1, ROUND(e.new_mid * 1.08, 2))
@@ -1726,14 +1991,13 @@ UPDATE p3_market m
                  * (0.9987 + RANDOM() * 0.0026), 2) AS new_mid
           FROM p3_market m2) e
     WHERE e.city_id = m.city_id AND e.good_id = m.good_id;
--- Advance calendar
 UPDATE p3_player
     SET game_day  = CASE WHEN game_day >= 360 THEN 1      ELSE game_day + 1  END,
         game_year = CASE WHEN game_day >= 360 THEN game_year + 1 ELSE game_year END;
--- Fire pg_notify so any LISTEN client gets the event
 SELECT p3_notify_tick();
 TKSQL
-        # Write last-tick state to file for dashboard (avoids an extra query)
+        # NPC AI tick
+        p3_npc_tick
         p3_psql --tuples-only -c "
             SELECT json_build_object(
                 'year', game_year, 'day', game_day, 'gold', ROUND(gold, 2)
@@ -1742,10 +2006,7 @@ TKSQL
     done
 }
 
-# ── Internal: psql LISTEN session — writes each notification to state file
 _p3_listen_loop() {
-    # pg_sleep(86400) keeps the connection open for up to 24 h; psql prints
-    # async notifications as they arrive on stdout, which we parse here.
     printf 'LISTEN p3_day_tick;\nSELECT pg_sleep(86400);\n' \
         | psql -X --username="$P3_USER" --dbname="$P3_DB" --no-readline 2>/dev/null \
         | while IFS= read -r line; do
@@ -1769,7 +2030,6 @@ p3_start_tick() {
     success "⏱  Auto-tick STARTED — 1 game day every ${P3_TICK_INTERVAL}s"
     info    "   Tick PID   : $(cat "$P3_TICK_PID_FILE")"
     info    "   pg_notify  : channel p3_day_tick  (payload = JSON)"
-    info    "   External   : psql -c \"LISTEN p3_day_tick;\""
 }
 
 p3_stop_tick() {
@@ -1792,8 +2052,6 @@ p3_tick_status() {
         if [[ -f "$P3_TICK_STATE_FILE" ]]; then
             info "   Last tick state : $(cat "$P3_TICK_STATE_FILE")"
         fi
-        info    "   pg_notify channel : p3_day_tick"
-        info    "   LISTEN externally : psql -U ${P3_USER} ${P3_DB} -c 'LISTEN p3_day_tick;'"
     else
         rm -f "$P3_TICK_PID_FILE" "$P3_LISTEN_PID_FILE" 2>/dev/null || true
         warn "⏹  Stopped — use 'Start Auto-Tick' from the Simulation menu to begin."
@@ -1809,18 +2067,16 @@ p3_set_tick_interval() {
     success "Tick interval set to ${P3_TICK_INTERVAL}s/day."
     if [[ -f "$P3_TICK_PID_FILE" ]] && kill -0 "$(cat "$P3_TICK_PID_FILE")" 2>/dev/null; then
         if confirm "Restart daemon now to apply the new interval?"; then
-            p3_stop_tick
-            p3_start_tick
+            p3_stop_tick; p3_start_tick
         fi
     fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14n  RICH MAIN DASHBOARD
+#  §14i  MAIN DASHBOARD
 #
-#  Displayed at the top of every patrician_menu iteration.
-#  Uses full terminal width: left panel = status + fleet,
-#  right panel = live arbitrage opportunities.
+#  · Non-admin: left panel = status + fleet; right panel = Lübeck market
+#  · Admin:     left panel = status + fleet; right panel = arbitrage table
 # ─────────────────────────────────────────────────────────────────────────────
 p3_main_dashboard() {
     local cols half ruler
@@ -1830,21 +2086,29 @@ p3_main_dashboard() {
     [[ $half -gt 64 ]] && half=64
     ruler=$(printf '─%.0s' $(seq 1 $((half - 4))))
 
-    # ── Single DB round-trip: player + fleet counts ──────────────────────────
-    local gold rank gyear gday docked sailing
+    # Single DB round-trip
+    local gold rank gyear gday docked sailing is_admin counting_houses visible_cities
     {
-        read -r gold; read -r rank; read -r gyear
-        read -r gday; read -r docked; read -r sailing
+        read -r gold; read -r rank; read -r gyear; read -r gday
+        read -r docked; read -r sailing; read -r is_admin
+        read -r counting_houses; read -r visible_cities
     } < <(p3_psql --tuples-only -c "
         SELECT pl.gold::text, pl.rank,
                pl.game_year::text, pl.game_day::text,
                (SELECT COUNT(*)::text FROM p3_ships WHERE owner='player' AND status='docked'),
-               (SELECT COUNT(*)::text FROM p3_ships WHERE owner='player' AND status='sailing')
+               (SELECT COUNT(*)::text FROM p3_ships WHERE owner='player' AND status='sailing'),
+               pl.is_admin::text,
+               (SELECT COUNT(*)::text FROM p3_counting_houses),
+               (SELECT COUNT(DISTINCT city_id)::text FROM p3_player_visible_city_ids())
         FROM p3_player pl LIMIT 1;" 2>/dev/null \
         | sed 's/|/\n/g; s/^ *//; s/ *$//' \
-        || printf '???\nApprentice\n???\n0\n0\n0\n')
+        || printf '???\nApprentice\n???\n0\n0\n0\nf\n0\n1\n')
 
-    # ── Fleet detail lines ───────────────────────────────────────────────────
+    is_admin="${is_admin:-f}"
+    counting_houses="${counting_houses:-0}"
+    visible_cities="${visible_cities:-1}"
+
+    # Fleet detail lines
     local fleet_lines
     fleet_lines=$(p3_psql --tuples-only -c "
         SELECT '  ' || RPAD(name, 14) ||
@@ -1856,7 +2120,6 @@ p3_main_dashboard() {
         FROM p3_fleet_view ORDER BY status DESC, name LIMIT 6;" 2>/dev/null \
         | grep -v '^\s*$' || echo "  (no ships in fleet)")
 
-    # ── Tick badge ───────────────────────────────────────────────────────────
     local tick_badge
     if [[ -f "$P3_TICK_PID_FILE" ]] && kill -0 "$(cat "$P3_TICK_PID_FILE")" 2>/dev/null; then
         tick_badge="⏱  Auto-tick RUNNING   ${P3_TICK_INTERVAL}s / day"
@@ -1864,27 +2127,21 @@ p3_main_dashboard() {
         tick_badge="⏹  Manual mode  ·  Simulation › Start Auto-Tick"
     fi
 
-    # ── Arbitrage opportunities ──────────────────────────────────────────────
-    local arb_lines
-    arb_lines=$(p3_psql --tuples-only -c "
-        SELECT '  ' || RPAD(good, 12)    ||
-                       RPAD(buy_city, 14) ||
-               '→  '|| RPAD(sell_city, 14) ||
-               '+' || profit_per_unit || '/u'
-        FROM p3_arbitrage_view LIMIT 7;" 2>/dev/null \
-        | grep -v '^\s*$' || echo "  (run Initialise / Reset Game first)")
-
-    # ── Render left panel: status + fleet ────────────────────────────────────
+    # Left panel: status + fleet
     local panel_left
     panel_left=$(
     {
         printf '⚓  PATRICIAN  III / IV\n'
+        [[ "$is_admin" == "t" ]] && printf '🔑  ADMINISTRATOR MODE\n'
         printf '%s\n' "$ruler"
         printf '📅  Year %-6s  ·  Day %03d\n' "${gyear:-???}" "${gday:-0}"
         printf '💰  %-22s  🏅  %s\n' "${gold:-???} gold" "${rank:-Apprentice}"
         printf '%s\n' "$ruler"
         printf '🚢  %s docked   ·   %s at sea\n' "${docked:-0}" "${sailing:-0}"
         printf '%s\n' "$fleet_lines"
+        printf '%s\n' "$ruler"
+        printf '👁  Visible cities: %s  ·  Counting houses: %s\n' \
+            "$visible_cities" "$counting_houses"
         printf '%s\n' "$ruler"
         printf '%s\n' "$tick_badge"
     } | gum style \
@@ -1893,34 +2150,67 @@ p3_main_dashboard() {
             --padding "0 2" \
             --width "$half")
 
-    # ── Render right panel: arbitrage ────────────────────────────────────────
-    local panel_right
-    panel_right=$(
-    {
-        printf '📊  ARBITRAGE OPPORTUNITIES\n'
-        printf '%s\n' "$ruler"
-        printf '  %-12s %-14s %-14s %s\n' "GOOD" "BUY AT" "SELL AT" "PROFIT"
-        printf '%s\n' "$ruler"
-        printf '%s\n' "$arb_lines"
-    } | gum style \
-            --border rounded \
-            --border-foreground 214 \
-            --padding "0 2" \
-            --width "$half")
+    # Right panel: Lübeck market (players) or arbitrage (admins)
+    local panel_right rp_color
+    if [[ "$is_admin" == "t" ]]; then
+        rp_color=214
+        local arb_lines
+        arb_lines=$(p3_psql --tuples-only -c "
+            SELECT '  ' || RPAD(good, 12)     ||
+                           RPAD(buy_city, 14)  ||
+                   '→  '|| RPAD(sell_city, 14) ||
+                   '+' || profit_per_unit || '/u'
+            FROM p3_admin_arbitrage_view LIMIT 7;" 2>/dev/null \
+            | grep -v '^\s*$' || echo "  (no arbitrage data)")
+        panel_right=$(
+        {
+            printf '📊  ARBITRAGE  [ADMIN]\n'
+            printf '%s\n' "$ruler"
+            printf '  %-12s %-14s %-14s %s\n' "GOOD" "BUY AT" "SELL AT" "PROFIT"
+            printf '%s\n' "$ruler"
+            printf '%s\n' "$arb_lines"
+        } | gum style \
+                --border rounded \
+                --border-foreground "$rp_color" \
+                --padding "0 2" \
+                --width "$half")
+    else
+        rp_color=33
+        local lub_lines
+        lub_lines=$(p3_psql --tuples-only -c "
+            SELECT '  ' || RPAD(good, 12) ||
+                           RPAD(ask::text, 10) ||
+                           RPAD(bid::text, 10) ||
+                   signal
+            FROM p3_lubeck_market_view LIMIT 10;" 2>/dev/null \
+            | grep -v '^\s*$' || echo "  (market not seeded)")
+        panel_right=$(
+        {
+            printf '🏠  LÜBECK MARKET\n'
+            printf '%s\n' "$ruler"
+            printf '  %-12s %-10s %-10s\n' "GOOD" "ASK" "BID"
+            printf '%s\n' "$ruler"
+            printf '%s\n' "$lub_lines"
+        } | gum style \
+                --border rounded \
+                --border-foreground "$rp_color" \
+                --padding "0 2" \
+                --width "$half")
+    fi
 
     gum join --horizontal --align top "$panel_left" "  " "$panel_right"
     echo
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14g  MAIN PATRICIAN MENU
+#  §14j  MAIN PATRICIAN MENU
 # ─────────────────────────────────────────────────────────────────────────────
 patrician_menu() {
     push_breadcrumb "⚓ Patrician"
     while true; do
         p3_main_dashboard
 
-        choice="$(gum choose --height 40 \
+        choice="$(gum choose --height 44 \
             "── Setup ──" \
             "Initialise / Reset Game" \
             "Reseed Market Prices" \
@@ -1933,6 +2223,9 @@ patrician_menu() {
             "── Trading ──" \
             "Buy Goods at City" \
             "Sell Goods at City" \
+            "── Presence ──" \
+            "Establish Counting House" \
+            "View My Counting Houses" \
             "── Buildings ──" \
             "🏭 Manage Buildings & Limit Orders" \
             "── Market ──" \
@@ -1961,28 +2254,32 @@ patrician_menu() {
             "Set Tick Interval" \
             "── Log ──" \
             "View Trade Log" \
+            "── Admin ──" \
+            "🤖 NPC Fleet (Admin)" \
             "── Mediterranean ──" \
             "🌊 Patrician IV — Mediterranean" \
             "Back")"
 
         case "$choice" in
-            "── Setup ──"|"── Fleet ──"|"── Trading ──"|"── Buildings ──"|\
-            "── Market ──"|"── Routes ──"|"── World ──"|"── Time ──"|\
-            "── Simulation ──"|"── Log ──"|"── Mediterranean ──")
+            "── Setup ──"|"── Fleet ──"|"── Trading ──"|"── Presence ──"|\
+            "── Buildings ──"|"── Market ──"|"── Routes ──"|"── World ──"|\
+            "── Time ──"|"── Simulation ──"|"── Log ──"|"── Admin ──"|\
+            "── Mediterranean ──")
                 continue ;;
 
             "🗺 Hex Map & City Distances")      p3_hex_menu ;;
             "📊 Market Elasticity & Price Curves") p3_elasticity_menu ;;
             "🏭 Manage Buildings & Limit Orders")  p3_buildings_menu ;;
             "🌊 Patrician IV — Mediterranean")     p3_p4_menu ;;
+            "🤖 NPC Fleet (Admin)")                p3_npc_menu ;;
 
-            # ── SIMULATION ─────────────────────────────────────────────────
-            "Start Auto-Tick")    p3_start_tick ;;
-            "Stop Auto-Tick")     p3_stop_tick  ;;
-            "Tick Status")        p3_tick_status ;;
-            "Set Tick Interval")  p3_set_tick_interval ;;
+            # ── SIMULATION ────────────────────────────────────────────────
+            "Start Auto-Tick")   p3_start_tick ;;
+            "Stop Auto-Tick")    p3_stop_tick  ;;
+            "Tick Status")       p3_tick_status ;;
+            "Set Tick Interval") p3_set_tick_interval ;;
 
-            # ── SETUP ──────────────────────────────────────────────────────
+            # ── SETUP ─────────────────────────────────────────────────────
             "Initialise / Reset Game")
                 if confirm "Create/reset ALL Patrician tables and seed data?"; then
                     p3_setup_all
@@ -2011,7 +2308,7 @@ patrician_menu() {
                     success "Market prices re-randomised."
                 fi ;;
 
-            # ── FLEET ──────────────────────────────────────────────────────
+            # ── FLEET ─────────────────────────────────────────────────────
             "View Fleet")
                 p3_psql -c "
                     SELECT ship_id AS id, name, ship_type AS type,
@@ -2040,9 +2337,9 @@ patrician_menu() {
                     *Carrack*) cap=220; cost=9000; spd=5.5; stype="Carrack" ;;
                     *) pause; continue ;;
                 esac
-                local gold; gold=$(p3_gold)
-                if awk "BEGIN{exit !(${gold}+0 < ${cost}+0)}"; then
-                    error "Not enough gold (have ${gold}g, need ${cost}g)."
+                local gold_now; gold_now=$(p3_gold)
+                if awk "BEGIN{exit !(${gold_now}+0 < ${cost}+0)}"; then
+                    error "Not enough gold (have ${gold_now}g, need ${cost}g)."
                 else
                     local sname home
                     sname=$(gum input --placeholder "Name your new ship")
@@ -2064,13 +2361,13 @@ patrician_menu() {
 
             "Give Sail Order")
                 local sid; sid=$(p3_pick_ship) || { pause; continue; }
-                local sname scity status
+                local sname scity sstatus
                 sname=$(p3_psql --tuples-only -c "SELECT name         FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
                 scity=$(p3_psql --tuples-only -c "SELECT current_city FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
-                status=$(p3_psql --tuples-only -c "SELECT status       FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
-                if [[ "$status" != "docked" ]]; then
+                sstatus=$(p3_psql --tuples-only -c "SELECT status      FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
+                if [[ "$sstatus" != "docked" ]]; then
                     local eta; eta=$(p3_psql --tuples-only -c "SELECT eta_days FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
-                    warn "$sname is $status (ETA ${eta} day(s))."
+                    warn "$sname is $sstatus (ETA ${eta} day(s))."
                     pause; continue
                 fi
                 info "Select destination for $sname (currently in $scity):"
@@ -2091,13 +2388,13 @@ patrician_menu() {
                     WHERE  c.ship_id = $sid AND c.quantity > 0
                     ORDER  BY g.name;" ;;
 
-            # ── TRADING ────────────────────────────────────────────────────
+            # ── TRADING ───────────────────────────────────────────────────
             "Buy Goods at City")
                 local sid; sid=$(p3_pick_ship) || { pause; continue; }
-                local scity status
+                local scity sstatus
                 scity=$(p3_psql --tuples-only -c "SELECT current_city FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
-                status=$(p3_psql --tuples-only -c "SELECT status FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
-                [[ "$status" != "docked" ]] && { warn "Ship must be docked to trade."; pause; continue; }
+                sstatus=$(p3_psql --tuples-only -c "SELECT status FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
+                [[ "$sstatus" != "docked" ]] && { warn "Ship must be docked to trade."; pause; continue; }
                 p3_psql -c "
                     SELECT g.name AS good, m.current_buy AS ask, m.current_sell AS bid,
                            m.stock, mv.signal
@@ -2116,10 +2413,10 @@ patrician_menu() {
 
             "Sell Goods at City")
                 local sid; sid=$(p3_pick_ship) || { pause; continue; }
-                local scity status
+                local scity sstatus
                 scity=$(p3_psql --tuples-only -c "SELECT current_city FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
-                status=$(p3_psql --tuples-only -c "SELECT status FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
-                [[ "$status" != "docked" ]] && { warn "Ship must be docked to trade."; pause; continue; }
+                sstatus=$(p3_psql --tuples-only -c "SELECT status FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
+                [[ "$sstatus" != "docked" ]] && { warn "Ship must be docked to trade."; pause; continue; }
                 p3_psql -c "
                     SELECT g.name AS good, c.quantity AS aboard,
                            m.current_sell AS bid, m.stock
@@ -2137,49 +2434,112 @@ patrician_menu() {
                 [[ -z "$qty" || ! "$qty" =~ ^[0-9]+$ ]] && { error "Invalid quantity."; pause; continue; }
                 p3_do_sell "$sid" "$good" "$qty" "$scity" ;;
 
-            # ── MARKET ─────────────────────────────────────────────────────
+            # ── PRESENCE (COUNTING HOUSES) ────────────────────────────────
+            "Establish Counting House")
+                local city city_id cost gold_now
+                city=$(p3_pick_city)
+                [[ -z "$city" ]] && { pause; continue; }
+                city_id=$(p3_psql --tuples-only -c \
+                    "SELECT city_id FROM p3_cities WHERE name='$city';" | tr -d ' ')
+
+                local exists
+                exists=$(p3_psql --tuples-only -c \
+                    "SELECT COUNT(*) FROM p3_counting_houses WHERE city_id=$city_id;" | tr -d ' ')
+                if [[ "${exists:-0}" -gt 0 ]]; then
+                    warn "You already have a counting house in $city."
+                    pause; continue
+                fi
+
+                cost=$(p3_psql --tuples-only -c \
+                    "SELECT p3_counting_house_cost('$city');" | tr -d ' ')
+                gold_now=$(p3_gold)
+                info "Counting house in $city costs ${cost}g."
+                info "Grants permanent market visibility and enables orders there."
+
+                if awk "BEGIN{exit !(${gold_now}+0 < ${cost}+0)}"; then
+                    error "Not enough gold (have ${gold_now}g, need ${cost}g)."
+                    pause; continue
+                fi
+
+                if confirm "Establish counting house in $city for ${cost}g?"; then
+                    p3_psql -c "
+                        INSERT INTO p3_counting_houses (city_name, city_id)
+                        VALUES ('$city', $city_id);
+                        UPDATE p3_player SET gold = gold - $cost;" >/dev/null
+                    success "Counting house established in $city."
+                fi ;;
+
+            "View My Counting Houses")
+                p3_psql -c "
+                    SELECT ch.city_name AS city, ci.region, ci.population,
+                           ci.league, ch.established::date AS since,
+                           p3_counting_house_cost(ch.city_name) AS build_cost_ref
+                    FROM p3_counting_houses ch
+                    JOIN p3_cities ci ON ci.city_id = ch.city_id
+                    ORDER BY ch.city_name;" ;;
+
+            # ── MARKET ────────────────────────────────────────────────────
             "View Market at City")
                 local city; city=$(p3_pick_city)
                 [[ -z "$city" ]] && { pause; continue; }
+                local can_see
+                can_see=$(p3_psql --tuples-only -c "
+                    SELECT COUNT(*) FROM p3_player_visible_city_ids() vid
+                    JOIN p3_cities ci ON ci.city_id = vid.city_id
+                    WHERE ci.name = '$city';" | tr -d ' ')
+                if [[ "${can_see:-0}" -eq 0 ]]; then
+                    warn "You have no presence in $city."
+                    info  "Sail a ship there or establish a counting house to see prices."
+                    pause; continue
+                fi
                 p3_psql -c "
                     SELECT good, current_buy AS ask, current_sell AS bid,
                            stock, signal
-                    FROM p3_market_view WHERE city = '$city'
+                    FROM p3_visible_market_view WHERE city = '$city'
                     ORDER BY good;" ;;
 
             "Best Arbitrage Opportunities")
+                local is_adm
+                is_adm=$(p3_psql --tuples-only -c "SELECT is_admin FROM p3_player;" | tr -d ' ')
+                if [[ "$is_adm" != "t" ]]; then
+                    warn "Arbitrage data is restricted to administrators."
+                    info  "Only senior merchants with city council access can view this."
+                    pause; continue
+                fi
                 p3_psql -c "
                     SELECT buy_city, sell_city, good,
-                           buy_price, sell_price, profit_per_unit, buy_stock
-                    FROM p3_arbitrage_view
+                           buy_price, sell_price, profit_per_unit,
+                           buy_stock, route_days_snaikka
+                    FROM p3_admin_arbitrage_view
                     LIMIT 20;" ;;
 
             "Cross-League Opportunities  (Hanse ↔ Med)")
+                local is_adm
+                is_adm=$(p3_psql --tuples-only -c "SELECT is_admin FROM p3_player;" | tr -d ' ')
+                if [[ "$is_adm" != "t" ]]; then
+                    warn "Cross-league data requires administrator access."
+                    pause; continue
+                fi
                 p3_psql -c "
-                    SELECT av.buy_city, av.sell_city, av.good,
-                           av.buy_price, av.sell_price, av.profit_per_unit,
-                           r.travel_days                                       AS days_snaikka,
-                           GREATEST(1, ROUND(r.travel_days*5.0/7.0)::INTEGER) AS days_crayer,
-                           GREATEST(1, ROUND(r.travel_days*5.0/9.0)::INTEGER) AS days_galley
-                    FROM p3_arbitrage_view av
-                    LEFT JOIN p3_routes r ON
-                        (r.city_a = av.buy_city AND r.city_b = av.sell_city) OR
-                        (r.city_b = av.buy_city AND r.city_a = av.sell_city)
-                    WHERE av.profit_per_unit > 0
-                      AND (
-                        (av.buy_city  IN (SELECT name FROM p3_cities WHERE league = 'Hanseatic')
-                         AND av.sell_city IN (SELECT name FROM p3_cities WHERE league = 'Mediterranean'))
-                        OR
-                        (av.buy_city  IN (SELECT name FROM p3_cities WHERE league = 'Mediterranean')
-                         AND av.sell_city IN (SELECT name FROM p3_cities WHERE league = 'Hanseatic'))
-                      )
-                    ORDER BY av.profit_per_unit DESC LIMIT 15;" ;;
+                    SELECT buy_city, sell_city, good, buy_price, sell_price,
+                           profit_per_unit, route_days_snaikka, days_crayer, days_galley
+                    FROM p3_admin_crossleague_view LIMIT 15;" ;;
 
             "Price History for Good")
                 local good; good=$(p3_pick_good)
                 [[ -z "$good" ]] && { pause; continue; }
                 local city; city=$(p3_pick_city)
                 [[ -z "$city" ]] && { pause; continue; }
+                # Check visibility
+                local can_see
+                can_see=$(p3_psql --tuples-only -c "
+                    SELECT COUNT(*) FROM p3_player_visible_city_ids() vid
+                    JOIN p3_cities ci ON ci.city_id = vid.city_id
+                    WHERE ci.name = '$city';" | tr -d ' ')
+                if [[ "${can_see:-0}" -eq 0 ]]; then
+                    warn "No price data available — you have no presence in $city."
+                    pause; continue
+                fi
                 p3_psql -c "
                     SELECT game_year, game_day, buy_price, sell_price, stock
                     FROM p3_price_history ph
@@ -2196,7 +2556,7 @@ patrician_menu() {
                            is_raw_material AS raw
                     FROM p3_goods ORDER BY category, name;" ;;
 
-            # ── ROUTES ─────────────────────────────────────────────────────
+            # ── ROUTES ────────────────────────────────────────────────────
             "View All Routes")
                 p3_psql -c "
                     SELECT name, city_a, city_b, distance_nm,
@@ -2227,11 +2587,9 @@ patrician_menu() {
                 rname=$(echo "$rlist" | gum filter --placeholder "Select route…")
                 rid="${rname%% *}"
                 [[ -z "$rid" ]] && { pause; continue; }
-                local city; city=$(p3_pick_city)
-                [[ -z "$city" ]] && { pause; continue; }
+                local city; city=$(p3_pick_city); [[ -z "$city" ]] && { pause; continue; }
                 local action; action=$(gum choose "buy" "sell")
-                local good; good=$(p3_pick_good)
-                [[ -z "$good" ]] && { pause; continue; }
+                local good; good=$(p3_pick_good); [[ -z "$good" ]] && { pause; continue; }
                 local gid; gid=$(p3_psql --tuples-only -c "SELECT good_id FROM p3_goods WHERE name='$good';" | tr -d ' ')
                 local qty; qty=$(gum input --placeholder "Quantity" --value "10")
                 local maxp; maxp=$(gum input --placeholder "Max/min price (blank = no limit)")
@@ -2258,7 +2616,7 @@ patrician_menu() {
                             VALUES ($sid, $rid, TRUE) ON CONFLICT DO NOTHING;" >/dev/null
                 success "Ship assigned to route." ;;
 
-            # ── WORLD ──────────────────────────────────────────────────────
+            # ── WORLD ─────────────────────────────────────────────────────
             "View All Cities")
                 p3_psql -c "
                     SELECT name, region, league, population,
@@ -2277,7 +2635,7 @@ patrician_menu() {
                     JOIN p3_cities  ci ON ci.city_id = cg.city_id AND ci.name = '$city'
                     ORDER BY cg.role, g.name;" ;;
 
-            # ── TIME ───────────────────────────────────────────────────────
+            # ── TIME ──────────────────────────────────────────────────────
             "Advance One Day")
                 p3_advance_day ;;
 
@@ -2291,7 +2649,7 @@ patrician_menu() {
                 done
                 success "Advanced $ndays days." ;;
 
-            # ── LOG ────────────────────────────────────────────────────────
+            # ── LOG ───────────────────────────────────────────────────────
             "View Trade Log")
                 p3_psql -c "
                     SELECT game_year, game_day, action,
@@ -2312,7 +2670,58 @@ patrician_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14h  PATRICIAN IV MENU
+#  §14k  NPC FLEET MENU  (admin)
+# ─────────────────────────────────────────────────────────────────────────────
+p3_npc_menu() {
+    local is_adm
+    is_adm=$(p3_psql --tuples-only -c "SELECT is_admin FROM p3_player;" | tr -d ' ')
+    if [[ "$is_adm" != "t" ]]; then
+        warn "NPC fleet management requires administrator access."
+        return
+    fi
+    push_breadcrumb "🤖 NPC Fleet"
+    while true; do
+        section_header "🤖 NPC Merchant Fleet"
+        choice=$(gum choose \
+            "View NPC Fleet Summary" \
+            "View NPC Ships Visible in My Cities" \
+            "View NPC Trade Log" \
+            "Run NPC AI Tick Manually" \
+            "Back")
+
+        case "$choice" in
+            "View NPC Fleet Summary")
+                p3_psql -c "
+                    SELECT ship, specialisation, current_city, status,
+                           destination, ai_state, trips_completed, total_profit
+                    FROM p3_npc_fleet_summary;" ;;
+
+            "View NPC Ships Visible in My Cities")
+                p3_psql -c "
+                    SELECT name AS ship, ship_type, current_city,
+                           status, specialisation
+                    FROM p3_visible_npc_ships
+                    ORDER BY current_city, name;" ;;
+
+            "View NPC Trade Log")
+                p3_psql -c "
+                    SELECT game_year, game_day, ship_name, good_name,
+                           action, city, quantity, price, profit
+                    FROM p3_npc_trade_log
+                    ORDER BY log_id DESC LIMIT 40;" ;;
+
+            "Run NPC AI Tick Manually")
+                p3_npc_tick
+                success "NPC AI tick complete." ;;
+
+            "Back" | *) pop_breadcrumb; return ;;
+        esac
+        pause
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14l  PATRICIAN IV MENU
 # ─────────────────────────────────────────────────────────────────────────────
 p3_p4_menu() {
     push_breadcrumb "🌊 Patrician IV"
@@ -2340,44 +2749,51 @@ p3_p4_menu() {
             "Back")"
 
         case "$choice" in
-            "── Mediterranean Market ──"|"── Mediterranean Cities ──"|"── Goods ──"|"── Ships ──")
+            "── Mediterranean Market ──"|"── Mediterranean Cities ──"|\
+            "── Goods ──"|"── Ships ──")
                 continue ;;
 
             "View Med Market (All Cities)")
-                p3_psql -c "
-                    SELECT city, good, current_buy, current_sell, stock, signal
-                    FROM p3_market_view WHERE league = 'Mediterranean'
-                    ORDER BY city, good;" ;;
+                local is_adm
+                is_adm=$(p3_psql --tuples-only -c "SELECT is_admin FROM p3_player;" | tr -d ' ')
+                if [[ "$is_adm" == "t" ]]; then
+                    p3_psql -c "
+                        SELECT city, good, current_buy, current_sell, stock, signal
+                        FROM p3_market_view WHERE league = 'Mediterranean'
+                        ORDER BY city, good;"
+                else
+                    p3_psql -c "
+                        SELECT city, good, current_buy, current_sell, stock, signal
+                        FROM p3_visible_market_view WHERE league = 'Mediterranean'
+                        ORDER BY city, good;"
+                fi ;;
 
             "Med Arbitrage Opportunities")
+                local is_adm
+                is_adm=$(p3_psql --tuples-only -c "SELECT is_admin FROM p3_player;" | tr -d ' ')
+                if [[ "$is_adm" != "t" ]]; then
+                    warn "Arbitrage data is restricted to administrators."
+                    pause; continue
+                fi
                 p3_psql -c "
                     SELECT buy_city, sell_city, good, buy_price, sell_price,
                            profit_per_unit, buy_stock
-                    FROM p3_arbitrage_view
+                    FROM p3_admin_arbitrage_view
                     WHERE buy_city  IN (SELECT name FROM p3_cities WHERE league = 'Mediterranean')
                        OR sell_city IN (SELECT name FROM p3_cities WHERE league = 'Mediterranean')
                     ORDER BY profit_per_unit DESC LIMIT 20;" ;;
 
             "Cross-League Opportunities  (Hanse ↔ Med)")
+                local is_adm
+                is_adm=$(p3_psql --tuples-only -c "SELECT is_admin FROM p3_player;" | tr -d ' ')
+                if [[ "$is_adm" != "t" ]]; then
+                    warn "Cross-league data requires administrator access."
+                    pause; continue
+                fi
                 p3_psql -c "
-                    SELECT av.buy_city, av.sell_city, av.good,
-                           av.buy_price, av.sell_price, av.profit_per_unit,
-                           r.travel_days                                       AS days_snaikka,
-                           GREATEST(1, ROUND(r.travel_days*5.0/7.0)::INTEGER) AS days_crayer,
-                           GREATEST(1, ROUND(r.travel_days*5.0/9.0)::INTEGER) AS days_galley
-                    FROM p3_arbitrage_view av
-                    LEFT JOIN p3_routes r ON
-                        (r.city_a = av.buy_city AND r.city_b = av.sell_city) OR
-                        (r.city_b = av.buy_city AND r.city_a = av.sell_city)
-                    WHERE av.profit_per_unit > 0
-                      AND (
-                        (av.buy_city  IN (SELECT name FROM p3_cities WHERE league = 'Hanseatic')
-                         AND av.sell_city IN (SELECT name FROM p3_cities WHERE league = 'Mediterranean'))
-                        OR
-                        (av.buy_city  IN (SELECT name FROM p3_cities WHERE league = 'Mediterranean')
-                         AND av.sell_city IN (SELECT name FROM p3_cities WHERE league = 'Hanseatic'))
-                      )
-                    ORDER BY av.profit_per_unit DESC LIMIT 15;" ;;
+                    SELECT buy_city, sell_city, good, buy_price, sell_price,
+                           profit_per_unit, route_days_snaikka, days_crayer, days_galley
+                    FROM p3_admin_crossleague_view LIMIT 15;" ;;
 
             "View All Med Cities")
                 p3_psql -c "
@@ -2429,7 +2845,7 @@ p3_p4_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14i  BUILDINGS MENU (daily maintenance display)
+#  §14m  BUILDINGS MENU
 # ─────────────────────────────────────────────────────────────────────────────
 p3_buildings_menu() {
     push_breadcrumb "🏭 Buildings"
@@ -2498,7 +2914,7 @@ p3_buildings_menu() {
                         INSERT INTO p3_player_buildings (city_id, building_type_id, num_buildings)
                         VALUES ($city_id, $bt_id, 1) ON CONFLICT DO NOTHING;
                         UPDATE p3_player SET gold = gold - $bt_cost;" >/dev/null
-                    success "Built '$bt_name' in $city. It will produce each day tick."
+                    success "Built '$bt_name' in $city. Produces each day tick."
                 fi ;;
 
             "View My Buildings")
@@ -2664,7 +3080,7 @@ p3_buildings_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14j  ELASTICITY MENU  (view/tune marginal pricing)
+#  §14n  ELASTICITY MENU
 # ─────────────────────────────────────────────────────────────────────────────
 p3_elasticity_menu() {
     push_breadcrumb "📊 Elasticity"
@@ -2736,7 +3152,7 @@ p3_elasticity_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14k  HEX MAP MENU  (pointy-top system; uses p3_travel_days)
+#  §14o  HEX MAP MENU
 # ─────────────────────────────────────────────────────────────────────────────
 p3_hex_menu() {
     push_breadcrumb "🗺 Hex Map"
@@ -2788,8 +3204,7 @@ p3_hex_menu() {
                     WHERE ci.hex_q IS NOT NULL
                     ORDER BY ci.hex_r, ci.hex_q;" | cat
                 echo
-                gum style --foreground 244 \
-                    "Snaikka (5 kn): ~120 nm/day ≈ 2.4 hex/day." ;;
+                gum style --foreground 244 "Snaikka (5 kn): ~120 nm/day ≈ 2.4 hex/day." ;;
 
             "Distance Between Two Cities")
                 info "Select first city:";  local ca; ca=$(p3_pick_city)
@@ -2891,7 +3306,7 @@ p3_hex_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14l  ENTRY POINT — run standalone as ./patrician3.sh
+#  ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 run_app() {
     clear
@@ -2906,7 +3321,6 @@ run_app() {
     patrician_menu
 }
 
-# Only auto-run when executed directly (not when sourced into app.sh)
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     run_app
 fi
