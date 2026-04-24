@@ -2168,19 +2168,17 @@ p3_main_dashboard() {
         || printf '?\nBaltic\nHanseatic\nunmapped\n0\n')
 
     # Market: fetch as pairs for 2-column layout
-    # Each row: good|ask|bid|stock|signal — we'll interleave two per line
-    local mkt_col_w=$(( (right_w - 6) / 2 ))
     local lub_market_2col
     lub_market_2col=$(p3_psql --tuples-only -c "
         WITH numbered AS (
             SELECT ROW_NUMBER() OVER (ORDER BY good) AS rn,
                    RPAD(good, 12) || RPAD(ask::text, 9) || RPAD(bid::text, 8) ||
-                   RPAD(stock::text, 5) || signal AS entry
+                   RPAD(stock::text, 5) || COALESCE(signal,'–') AS entry
             FROM p3_lubeck_market_view
         ),
         odds  AS (SELECT rn, entry FROM numbered WHERE MOD(rn,2)=1),
         evens AS (SELECT rn, entry FROM numbered WHERE MOD(rn,2)=0)
-        SELECT '  ' || RPAD(o.entry, $((mkt_col_w))) || '  ' || COALESCE(e.entry,'')
+        SELECT '  ' || RPAD(o.entry, 40) || '  |  ' || COALESCE(e.entry,'')
         FROM odds o LEFT JOIN evens e ON e.rn = o.rn + 1
         ORDER BY o.rn;" 2>/dev/null \
         | grep -v '^\s*$' || echo "  (market not seeded)")
@@ -2210,13 +2208,13 @@ p3_main_dashboard() {
         ORDER BY bt.name;" 2>/dev/null \
         | grep -v '^\s*$' || echo "  none")
 
-    # Nearest cities — inline pairs
+    # Nearest cities — inline pairs, fixed 32-char column
     local lub_nearby_lines
     lub_nearby_lines=$(p3_psql --tuples-only -c "
         WITH n AS (
             SELECT ROW_NUMBER() OVER (ORDER BY p3_hex_distance(0,0,dest.hex_q,dest.hex_r)) AS rn,
-                   RPAD(dest.name, 13) ||
-                   RPAD(COALESCE(p3_hex_distance(0,0,dest.hex_q,dest.hex_r)::text||'hx','?'), 5) ||
+                   RPAD(dest.name, 14) ||
+                   RPAD(COALESCE(p3_hex_distance(0,0,dest.hex_q,dest.hex_r)::text||'hx','?'), 6) ||
                    COALESCE(p3_travel_days(src.city_id,dest.city_id,5.0)::text,'?')||'d' AS entry
             FROM p3_cities src, p3_cities dest
             WHERE src.name='Lübeck' AND dest.city_id<>src.city_id
@@ -2226,7 +2224,7 @@ p3_main_dashboard() {
         ),
         odds  AS (SELECT rn,entry FROM n WHERE MOD(rn,2)=1),
         evens AS (SELECT rn,entry FROM n WHERE MOD(rn,2)=0)
-        SELECT '  ' || RPAD(o.entry, 26) || '  ' || COALESCE(e.entry,'')
+        SELECT '  ' || RPAD(o.entry, 32) || '  ' || COALESCE(e.entry,'')
         FROM odds o LEFT JOIN evens e ON e.rn = o.rn+1
         ORDER BY o.rn;" 2>/dev/null \
         | grep -v '^\s*$' || echo "  (no hex data — run Initialise first)")
@@ -2292,85 +2290,54 @@ p3_main_dashboard() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14j  MAIN PATRICIAN MENU
+#  §14i-A  ADMIN & SETUP SUBMENU
 # ─────────────────────────────────────────────────────────────────────────────
-patrician_menu() {
-    push_breadcrumb "⚓ Patrician"
+p3_admin_menu() {
+    push_breadcrumb "⚙ Admin & Setup"
     while true; do
-        p3_main_dashboard
+        clear
+        section_header "⚙ Admin & Setup — Restricted Access"
 
-        # ── Menu items (shown as preview, filtered with gum filter) ────────
-        local _all_items
-        _all_items="$(printf '%s\n' \
-            "[Setup]  Initialise / Reset Game" \
-            "[Setup]  Reseed Market Prices" \
-            "[Fleet]  View Fleet" \
-            "[Fleet]  Buy a Ship" \
-            "[Fleet]  Rename Ship" \
-            "[Fleet]  Give Sail Order" \
-            "[Fleet]  View Ship Cargo" \
-            "[Trade]  Buy Goods at City" \
-            "[Trade]  Sell Goods at City" \
-            "[Presence]  Establish Counting House" \
-            "[Presence]  View My Counting Houses" \
-            "[Buildings]  🏭 Manage Buildings & Limit Orders" \
-            "[Market]  View Market at City" \
-            "[Market]  Best Arbitrage Opportunities" \
-            "[Market]  Cross-League Opportunities  (Hanse ↔ Med)" \
-            "[Market]  Price History for Good" \
-            "[Market]  Good Reference Prices" \
-            "[Routes]  View All Routes" \
-            "[Routes]  Create Trade Route" \
-            "[Routes]  Add Order to Route" \
-            "[Routes]  Assign Ship to Route" \
-            "[World]  View All Cities" \
-            "[World]  City Production Details" \
-            "[World]  🗺 Hex Map & City Distances" \
-            "[World]  📊 Market Elasticity & Price Curves" \
-            "[Time]  Advance One Day" \
-            "[Time]  Advance Multiple Days" \
-            "[Sim]  Start Auto-Tick" \
-            "[Sim]  Stop Auto-Tick" \
-            "[Sim]  Tick Status" \
-            "[Sim]  Set Tick Interval" \
-            "[Log]  View Trade Log" \
-            "[Admin]  🤖 NPC Fleet (Admin)" \
-            "[Med]  🌊 Patrician IV — Mediterranean" \
+        local choice
+        choice="$(gum choose \
+            "── Game Setup ──" \
+            "Initialise / Reset Game" \
+            "Reseed Market Prices" \
+            "── Simulation Ticker ──" \
+            "Start Auto-Tick" \
+            "Stop Auto-Tick" \
+            "Tick Status" \
+            "Set Tick Interval" \
+            "── Admin Tools ──" \
+            "🤖 NPC Fleet Management" \
+            "Best Arbitrage Opportunities" \
+            "Cross-League Opportunities  (Hanse ↔ Med)" \
             "Back")"
 
-        local _raw_choice
-        _raw_choice="$(printf '%s\n' "$_all_items" \
-            | gum filter \
-                --placeholder "Type to search actions…" \
-                --height 20 \
-                --prompt "▶ " \
-                --indicator "→")"
-        # Strip the [Category] prefix to get the canonical choice
-        choice="${_raw_choice#*\]  }"
-        [[ -z "$choice" ]] && continue
-
         case "$choice" in
+            "── Game Setup ──"|"── Simulation Ticker ──"|"── Admin Tools ──")
+                continue ;;
 
-            "🗺 Hex Map & City Distances")      p3_hex_menu ;;
-            "📊 Market Elasticity & Price Curves") p3_elasticity_menu ;;
-            "🏭 Manage Buildings & Limit Orders")  p3_buildings_menu ;;
-            "🌊 Patrician IV — Mediterranean")     p3_p4_menu ;;
-            "🤖 NPC Fleet (Admin)")                p3_npc_menu ;;
-
-            # ── SIMULATION ────────────────────────────────────────────────
-            "Start Auto-Tick")   p3_start_tick ;;
-            "Stop Auto-Tick")    p3_stop_tick  ;;
-            "Tick Status")       p3_tick_status ;;
-            "Set Tick Interval") p3_set_tick_interval ;;
-
-            # ── SETUP ─────────────────────────────────────────────────────
             "Initialise / Reset Game")
-                if confirm "Create/reset ALL Patrician tables and seed data?"; then
-                    p3_setup_all
+                warn "This will DESTROY and re-create ALL game tables and data."
+                warn "All progress, ships, gold, and market history will be LOST."
+                echo
+                if gum confirm --default=false "Are you absolutely sure you want to reset everything?"; then
+                    if gum confirm --default=false "Final confirmation — reset the game now?"; then
+                        p3_setup_all
+                        success "Game fully reset and re-seeded."
+                    else
+                        warn "Reset cancelled."
+                    fi
+                else
+                    warn "Reset cancelled."
                 fi ;;
 
             "Reseed Market Prices")
-                if confirm "Re-randomise all market prices (keeps stock levels)?"; then
+                warn "This will randomise ALL market prices across every city."
+                warn "Current price trends and spread data will be overwritten."
+                echo
+                if gum confirm --default=false "Are you sure you want to re-randomise market prices?"; then
                     p3_psql -c "
                         UPDATE p3_market m
                         SET current_buy  = ROUND(new_mid * 1.08, 2),
@@ -2390,7 +2357,369 @@ patrician_menu() {
                                 AND cg.role = 'produces'
                         ) e WHERE e.city_id = m.city_id AND e.good_id = m.good_id;" >/dev/null
                     success "Market prices re-randomised."
+                else
+                    warn "Reseed cancelled."
                 fi ;;
+
+            "Start Auto-Tick")   p3_start_tick ;;
+            "Stop Auto-Tick")    p3_stop_tick  ;;
+            "Tick Status")       p3_tick_status ;;
+            "Set Tick Interval") p3_set_tick_interval ;;
+
+            "🤖 NPC Fleet Management") p3_npc_menu ;;
+
+            "Best Arbitrage Opportunities")
+                local is_adm
+                is_adm=$(p3_psql --tuples-only -c "SELECT is_admin FROM p3_player;" | tr -d ' ')
+                if [[ "$is_adm" != "t" ]]; then
+                    warn "Arbitrage data is restricted to administrators."
+                    pause; continue
+                fi
+                p3_psql -c "
+                    SELECT buy_city, sell_city, good,
+                           buy_price, sell_price, profit_per_unit,
+                           buy_stock, route_days_snaikka
+                    FROM p3_admin_arbitrage_view
+                    LIMIT 20;" ;;
+
+            "Cross-League Opportunities  (Hanse ↔ Med)")
+                local is_adm
+                is_adm=$(p3_psql --tuples-only -c "SELECT is_admin FROM p3_player;" | tr -d ' ')
+                if [[ "$is_adm" != "t" ]]; then
+                    warn "Cross-league data requires administrator access."
+                    pause; continue
+                fi
+                p3_psql -c "
+                    SELECT buy_city, sell_city, good, buy_price, sell_price,
+                           profit_per_unit, route_days_snaikka, days_crayer, days_galley
+                    FROM p3_admin_crossleague_view LIMIT 15;" ;;
+
+            "Back" | *) pop_breadcrumb; return ;;
+        esac
+        pause
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14i-B  INTERACTIVE BUY — scrollable price list + marginal curve
+# ─────────────────────────────────────────────────────────────────────────────
+p3_interactive_buy() {
+    local sid="$1" scity="$2"
+    local gold cargo_free
+    gold=$(p3_gold)
+    cargo_free=$(p3_psql --tuples-only -c "SELECT cargo_free FROM p3_fleet_view WHERE ship_id=$sid;" | tr -d ' ')
+
+    # Build the goods list with price info as display lines
+    local goods_list
+    goods_list=$(p3_psql --tuples-only -c "
+        SELECT RPAD(g.name, 14) ||
+               '  ASK:'  || RPAD(m.current_buy::text, 9) ||
+               'BID:'  || RPAD(m.current_sell::text, 9) ||
+               'STK:'  || RPAD(m.stock::text, 6) ||
+               COALESCE(mv.signal,'–')
+        FROM   p3_market m
+        JOIN   p3_goods   g  ON g.good_id  = m.good_id
+        JOIN   p3_cities  ci ON ci.city_id = m.city_id AND ci.name = '$scity'
+        LEFT JOIN p3_market_view mv ON mv.city = '$scity' AND mv.good = g.name
+        ORDER  BY g.name;" 2>/dev/null | sed 's/^ *//' | grep -v '^$' || true)
+
+    [[ -z "$goods_list" ]] && { warn "No market data for $scity."; return; }
+
+    # Let user scroll/filter the list
+    gum style --foreground 33 --bold "🛒  BUY GOODS — $scity  |  💰 ${gold}g  |  🚢 free cargo: ${cargo_free}"
+    echo
+    gum style --foreground 244 "  $(printf '%-14s  %-18s %-18s %-11s' 'GOOD' 'ASK' 'BID' 'STOCK')"
+    echo
+
+    local chosen_line
+    chosen_line=$(printf '%s\n' "$goods_list" \
+        | gum filter \
+            --placeholder "Type to filter goods…" \
+            --height 20 \
+            --prompt "▶ " \
+            --indicator "→")
+    [[ -z "$chosen_line" ]] && return
+
+    # Extract good name (first 14 chars, trimmed)
+    local good
+    good=$(echo "$chosen_line" | awk '{print $1}')
+    [[ -z "$good" ]] && return
+
+    # Fetch market data for this good
+    local ask bid stock
+    {
+        read -r ask; read -r bid; read -r stock
+    } < <(p3_psql --tuples-only -c "
+        SELECT m.current_buy::text, m.current_sell::text, m.stock::text
+        FROM p3_market m
+        JOIN p3_cities ci ON ci.city_id = m.city_id AND ci.name = '$scity'
+        JOIN p3_goods  g  ON g.good_id  = m.good_id AND g.name = '$good'
+        LIMIT 1;" 2>/dev/null | sed 's/|/\n/g; s/^ *//; s/ *$//' \
+        || printf '0\n0\n0\n')
+
+    # Show marginal price curve (buy 1–20 units)
+    clear
+    gum style --foreground 212 --bold "📈  MARGINAL PRICE CURVE — $good in $scity"
+    gum style --foreground 244 "    Current ASK: ${ask}g  |  BID: ${bid}g  |  Stock: ${stock}  |  Your gold: ${gold}g"
+    echo
+    gum style --foreground 244 "  $(printf '%-6s %-12s %-12s %s' 'QTY' 'UNIT PRICE' 'TOTAL COST' 'AFFORDABLE?')"
+    p3_psql --tuples-only -c "
+        SELECT '  ' ||
+               LPAD(gs.qty::text, 4) || '   ' ||
+               RPAD(ROUND(
+                   (($ask/1.08 + $bid/0.92)/2.0)
+                   * POWER(
+                       e.stock_ref::NUMERIC
+                       / GREATEST($stock - gs.qty + 1, 1)::NUMERIC,
+                       e.elasticity_buy
+                   ) * 1.08,
+               2)::text, 11) ||
+               '  ' ||
+               RPAD(ROUND(
+                   SUM(
+                       (($ask/1.08 + $bid/0.92)/2.0)
+                       * POWER(
+                           e.stock_ref::NUMERIC
+                           / GREATEST($stock - generate_series(1,gs.qty) + 1, 1)::NUMERIC,
+                           e.elasticity_buy
+                       ) * 1.08
+                   ) OVER (ORDER BY gs.qty),
+               2)::text, 12) ||
+               CASE WHEN $gold >= SUM(
+                   (($ask/1.08 + $bid/0.92)/2.0)
+                   * POWER(
+                       e.stock_ref::NUMERIC
+                       / GREATEST($stock - generate_series(1,gs.qty) + 1, 1)::NUMERIC,
+                       e.elasticity_buy
+                   ) * 1.08
+               ) OVER (ORDER BY gs.qty)
+               THEN '✓' ELSE '✗ over budget' END
+        FROM generate_series(1,20) AS gs(qty)
+        JOIN p3_good_elasticity e ON e.good_id = (
+            SELECT good_id FROM p3_goods WHERE name = '$good')
+        ORDER BY gs.qty;" 2>/dev/null | grep -v '^\s*$' | cat
+    echo
+
+    # Ask quantity
+    local qty
+    qty=$(gum input --placeholder "How many units to buy? (0 to cancel)" --value "")
+    [[ -z "$qty" || ! "$qty" =~ ^[0-9]+$ || "$qty" == "0" ]] && { warn "Purchase cancelled."; return; }
+
+    # Compute final total cost via marginal pricing
+    local total_cost
+    total_cost=$(p3_psql --tuples-only -c "
+        SELECT ROUND(SUM(
+            (($ask/1.08 + $bid/0.92)/2.0)
+            * POWER(
+                e.stock_ref::NUMERIC
+                / GREATEST($stock - gs.qty + 1, 1)::NUMERIC,
+                e.elasticity_buy
+            ) * 1.08
+        ), 2)
+        FROM generate_series(1,$qty) AS gs(qty)
+        JOIN p3_good_elasticity e ON e.good_id = (
+            SELECT good_id FROM p3_goods WHERE name = '$good');" \
+        2>/dev/null | tr -d ' ' || echo "0")
+
+    echo
+    gum style --foreground 33 --bold "  SUMMARY: Buy $qty × $good in $scity"
+    gum style --foreground 244 "  Unit range: ${ask}g (1st unit) → marginal pricing applied"
+    gum style --foreground 76  "  Total cost: ${total_cost}g  |  Your gold: ${gold}g"
+    echo
+
+    if gum confirm --default=false "Confirm purchase: $qty × $good for ${total_cost}g?"; then
+        p3_do_buy "$sid" "$good" "$qty" "$scity"
+    else
+        warn "Purchase cancelled."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14i-C  INTERACTIVE SELL — cargo list + marginal curve
+# ─────────────────────────────────────────────────────────────────────────────
+p3_interactive_sell() {
+    local sid="$1" scity="$2"
+    local gold
+    gold=$(p3_gold)
+
+    # Build cargo list with current bid prices
+    local cargo_list
+    cargo_list=$(p3_psql --tuples-only -c "
+        SELECT RPAD(g.name, 14) ||
+               '  ABOARD:' || RPAD(c.quantity::text, 7) ||
+               'BID:'     || RPAD(m.current_sell::text, 9) ||
+               'STOCK:'   || RPAD(m.stock::text, 6) ||
+               'EST.VALUE:' || ROUND(m.current_sell * c.quantity, 2) || 'g'
+        FROM   p3_cargo c
+        JOIN   p3_goods  g  ON g.good_id  = c.good_id
+        JOIN   p3_ships  s  ON s.ship_id  = c.ship_id AND s.ship_id = $sid
+        JOIN   p3_cities ci ON ci.name    = s.current_city
+        JOIN   p3_market m  ON m.good_id  = c.good_id AND m.city_id = ci.city_id
+        WHERE  c.quantity > 0 ORDER BY g.name;" 2>/dev/null \
+        | sed 's/^ *//' | grep -v '^$' || true)
+
+    if [[ -z "$cargo_list" ]]; then
+        warn "No cargo aboard this ship."
+        return
+    fi
+
+    gum style --foreground 214 --bold "💰  SELL GOODS — $scity  |  Your gold: ${gold}g"
+    echo
+    gum style --foreground 244 "  $(printf '%-14s  %-16s %-18s %-11s %s' 'GOOD' 'ABOARD' 'BID' 'STOCK' 'EST.VALUE')"
+    echo
+
+    local chosen_line
+    chosen_line=$(printf '%s\n' "$cargo_list" \
+        | gum filter \
+            --placeholder "Type to filter cargo…" \
+            --height 20 \
+            --prompt "▶ " \
+            --indicator "→")
+    [[ -z "$chosen_line" ]] && return
+
+    local good
+    good=$(echo "$chosen_line" | awk '{print $1}')
+    [[ -z "$good" ]] && return
+
+    # Fetch market + cargo data
+    local ask bid stock aboard
+    {
+        read -r ask; read -r bid; read -r stock; read -r aboard
+    } < <(p3_psql --tuples-only -c "
+        SELECT m.current_buy::text, m.current_sell::text, m.stock::text,
+               COALESCE(c.quantity, 0)::text
+        FROM p3_market m
+        JOIN p3_cities ci ON ci.city_id = m.city_id AND ci.name = '$scity'
+        JOIN p3_goods  g  ON g.good_id  = m.good_id AND g.name = '$good'
+        LEFT JOIN p3_cargo c ON c.good_id = m.good_id AND c.ship_id = $sid
+        LIMIT 1;" 2>/dev/null | sed 's/|/\n/g; s/^ *//; s/ *$//' \
+        || printf '0\n0\n0\n0\n')
+
+    # Show marginal sell price curve (sell 1–20 units)
+    clear
+    gum style --foreground 214 --bold "📉  MARGINAL SELL CURVE — $good in $scity"
+    gum style --foreground 244 "    Current BID: ${bid}g  |  ASK: ${ask}g  |  Stock: ${stock}  |  Aboard: ${aboard}"
+    echo
+    gum style --foreground 244 "  $(printf '%-6s %-12s %-14s' 'QTY' 'UNIT PRICE' 'TOTAL REVENUE')"
+    p3_psql --tuples-only -c "
+        SELECT '  ' ||
+               LPAD(gs.qty::text, 4) || '   ' ||
+               RPAD(ROUND(
+                   (($ask/1.08 + $bid/0.92)/2.0)
+                   * POWER(
+                       e.stock_ref::NUMERIC
+                       / GREATEST($stock + gs.qty, 1)::NUMERIC,
+                       e.elasticity_sell
+                   ) * 0.92,
+               2)::text, 11) ||
+               '  ' ||
+               ROUND(
+                   SUM(
+                       (($ask/1.08 + $bid/0.92)/2.0)
+                       * POWER(
+                           e.stock_ref::NUMERIC
+                           / GREATEST($stock + generate_series(1,gs.qty), 1)::NUMERIC,
+                           e.elasticity_sell
+                       ) * 0.92
+                   ) OVER (ORDER BY gs.qty),
+               2)::text
+        FROM generate_series(1,20) AS gs(qty)
+        JOIN p3_good_elasticity e ON e.good_id = (
+            SELECT good_id FROM p3_goods WHERE name = '$good')
+        ORDER BY gs.qty;" 2>/dev/null | grep -v '^\s*$' | cat
+    echo
+
+    local qty
+    qty=$(gum input --placeholder "How many units to sell? (max ${aboard}, 0 to cancel)" --value "")
+    [[ -z "$qty" || ! "$qty" =~ ^[0-9]+$ || "$qty" == "0" ]] && { warn "Sale cancelled."; return; }
+
+    # Compute total revenue via marginal pricing
+    local total_revenue
+    total_revenue=$(p3_psql --tuples-only -c "
+        SELECT ROUND(SUM(
+            (($ask/1.08 + $bid/0.92)/2.0)
+            * POWER(
+                e.stock_ref::NUMERIC
+                / GREATEST($stock + gs.qty, 1)::NUMERIC,
+                e.elasticity_sell
+            ) * 0.92
+        ), 2)
+        FROM generate_series(1,$qty) AS gs(qty)
+        JOIN p3_good_elasticity e ON e.good_id = (
+            SELECT good_id FROM p3_goods WHERE name = '$good');" \
+        2>/dev/null | tr -d ' ' || echo "0")
+
+    echo
+    gum style --foreground 214 --bold "  SUMMARY: Sell $qty × $good in $scity"
+    gum style --foreground 244 "  Unit range: ${bid}g (1st unit) → marginal pricing applied"
+    gum style --foreground 76  "  Total revenue: ${total_revenue}g  |  Your gold after: $(awk "BEGIN{printf \"%.2f\", $gold + $total_revenue}")g"
+    echo
+
+    if gum confirm --default=false "Confirm sale: $qty × $good for ${total_revenue}g?"; then
+        p3_do_sell "$sid" "$good" "$qty" "$scity"
+    else
+        warn "Sale cancelled."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  §14j  MAIN PATRICIAN MENU
+# ─────────────────────────────────────────────────────────────────────────────
+patrician_menu() {
+    push_breadcrumb "⚓ Patrician"
+    while true; do
+        clear
+        p3_main_dashboard
+
+        # ── Menu items (shown as preview, filtered with gum filter) ────────
+        local _all_items
+        _all_items="$(printf '%s\n' \
+            "[Fleet]  View Fleet" \
+            "[Fleet]  Buy a Ship" \
+            "[Fleet]  Rename Ship" \
+            "[Fleet]  Give Sail Order" \
+            "[Fleet]  View Ship Cargo" \
+            "[Trade]  Buy Goods at City" \
+            "[Trade]  Sell Goods at City" \
+            "[Presence]  Establish Counting House" \
+            "[Presence]  View My Counting Houses" \
+            "[Buildings]  🏭 Manage Buildings & Limit Orders" \
+            "[Market]  View Market at City" \
+            "[Market]  Price History for Good" \
+            "[Market]  Good Reference Prices" \
+            "[Routes]  View All Routes" \
+            "[Routes]  Create Trade Route" \
+            "[Routes]  Add Order to Route" \
+            "[Routes]  Assign Ship to Route" \
+            "[World]  View All Cities" \
+            "[World]  City Production Details" \
+            "[World]  🗺 Hex Map & City Distances" \
+            "[World]  📊 Market Elasticity & Price Curves" \
+            "[Time]  Advance One Day" \
+            "[Time]  Advance Multiple Days" \
+            "[Log]  View Trade Log" \
+            "[Med]  🌊 Patrician IV — Mediterranean" \
+            "[Admin]  ⚙ Admin & Setup" \
+            "Back")"
+
+        local _raw_choice
+        _raw_choice="$(printf '%s\n' "$_all_items" \
+            | gum filter \
+                --placeholder "Type to search actions…" \
+                --height 20 \
+                --prompt "▶ " \
+                --indicator "→")"
+        # Strip the [Category] prefix to get the canonical choice
+        choice="${_raw_choice#*\]  }"
+        [[ -z "$choice" ]] && continue
+
+        case "$choice" in
+
+            "🗺 Hex Map & City Distances")         p3_hex_menu ;;
+            "📊 Market Elasticity & Price Curves") p3_elasticity_menu ;;
+            "🏭 Manage Buildings & Limit Orders")  p3_buildings_menu ;;
+            "🌊 Patrician IV — Mediterranean")     p3_p4_menu ;;
+            "⚙ Admin & Setup")                     p3_admin_menu ;;
 
             # ── FLEET ─────────────────────────────────────────────────────
             "View Fleet")
@@ -2479,21 +2808,7 @@ patrician_menu() {
                 scity=$(p3_psql --tuples-only -c "SELECT current_city FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
                 sstatus=$(p3_psql --tuples-only -c "SELECT status FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
                 [[ "$sstatus" != "docked" ]] && { warn "Ship must be docked to trade."; pause; continue; }
-                p3_psql -c "
-                    SELECT g.name AS good, m.current_buy AS ask, m.current_sell AS bid,
-                           m.stock, mv.signal
-                    FROM   p3_market m
-                    JOIN   p3_goods   g  ON g.good_id  = m.good_id
-                    JOIN   p3_cities  ci ON ci.city_id = m.city_id AND ci.name = '$scity'
-                    JOIN   p3_market_view mv ON mv.city = '$scity' AND mv.good = g.name
-                    ORDER  BY g.name;" | cat
-                echo
-                local good qty
-                good=$(p3_pick_good)
-                [[ -z "$good" ]] && { pause; continue; }
-                qty=$(gum input --placeholder "Quantity to buy")
-                [[ -z "$qty" || ! "$qty" =~ ^[0-9]+$ ]] && { error "Invalid quantity."; pause; continue; }
-                p3_do_buy "$sid" "$good" "$qty" "$scity" ;;
+                p3_interactive_buy "$sid" "$scity" ;;
 
             "Sell Goods at City")
                 local sid; sid=$(p3_pick_ship) || { pause; continue; }
@@ -2501,22 +2816,7 @@ patrician_menu() {
                 scity=$(p3_psql --tuples-only -c "SELECT current_city FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
                 sstatus=$(p3_psql --tuples-only -c "SELECT status FROM p3_ships WHERE ship_id=$sid;" | tr -d ' ')
                 [[ "$sstatus" != "docked" ]] && { warn "Ship must be docked to trade."; pause; continue; }
-                p3_psql -c "
-                    SELECT g.name AS good, c.quantity AS aboard,
-                           m.current_sell AS bid, m.stock
-                    FROM   p3_cargo c
-                    JOIN   p3_goods  g  ON g.good_id  = c.good_id
-                    JOIN   p3_ships  s  ON s.ship_id  = c.ship_id AND s.ship_id = $sid
-                    JOIN   p3_cities ci ON ci.name    = s.current_city
-                    JOIN   p3_market m  ON m.good_id  = c.good_id AND m.city_id = ci.city_id
-                    WHERE  c.quantity > 0 ORDER BY g.name;" | cat
-                echo
-                local good qty
-                good=$(p3_pick_good)
-                [[ -z "$good" ]] && { pause; continue; }
-                qty=$(gum input --placeholder "Quantity to sell")
-                [[ -z "$qty" || ! "$qty" =~ ^[0-9]+$ ]] && { error "Invalid quantity."; pause; continue; }
-                p3_do_sell "$sid" "$good" "$qty" "$scity" ;;
+                p3_interactive_sell "$sid" "$scity" ;;
 
             # ── PRESENCE (COUNTING HOUSES) ────────────────────────────────
             "Establish Counting House")
@@ -3171,22 +3471,32 @@ p3_elasticity_menu() {
     while true; do
         section_header "📊 Market Elasticity & Price Curves"
         choice="$(gum choose \
-            "View Elasticity Table" \
-            "Adjust Good Elasticity" \
+            "── Info ──" \
+            "Elasticity Reference Table" \
             "Preview Marginal Price Curve" \
+            "── Admin ──" \
+            "Adjust Good Elasticity" \
             "Back")"
 
         case "$choice" in
-            "View Elasticity Table")
-                p3_psql -c "
-                    SELECT g.name AS good, g.category,
-                           e.elasticity_buy  AS buy_e,
-                           e.elasticity_sell AS sell_e,
-                           e.stock_ref, e.price_floor_pct AS floor,
-                           e.price_ceil_pct  AS ceil
+            "── Info ──"|"── Admin ──") continue ;;
+
+            "Elasticity Reference Table")
+                gum style --foreground 33 --bold \
+                    "  $(printf '%-14s %-11s %-7s %-8s %-10s %-7s %s' \
+                        'GOOD' 'CATEGORY' 'BUY_E' 'SELL_E' 'STOCK_REF' 'FLOOR' 'CEIL')"
+                p3_psql --tuples-only -c "
+                    SELECT '  ' ||
+                           RPAD(g.name, 14) ||
+                           RPAD(g.category, 11) ||
+                           RPAD(e.elasticity_buy::text, 7) ||
+                           RPAD(e.elasticity_sell::text, 8) ||
+                           RPAD(e.stock_ref::text, 10) ||
+                           RPAD(e.price_floor_pct::text, 7) ||
+                           e.price_ceil_pct::text
                     FROM p3_goods g
                     JOIN p3_good_elasticity e ON e.good_id = g.good_id
-                    ORDER BY e.elasticity_buy DESC;" ;;
+                    ORDER BY e.elasticity_buy DESC;" 2>/dev/null | grep -v '^\s*$' | cat ;;
 
             "Adjust Good Elasticity")
                 local good; good=$(p3_pick_good); [[ -z "$good" ]] && { pause; continue; }
