@@ -2414,8 +2414,8 @@ p3_interactive_buy() {
     goods_list=$(p3_psql --tuples-only -c "
         SELECT RPAD(g.name, 14) ||
                '  ASK:'  || RPAD(m.current_buy::text, 9) ||
-               'BID:'  || RPAD(m.current_sell::text, 9) ||
-               'STK:'  || RPAD(m.stock::text, 6) ||
+               'BID:'    || RPAD(m.current_sell::text, 9) ||
+               'STK:'    || RPAD(m.stock::text, 6) ||
                COALESCE(mv.signal,'–')
         FROM   p3_market m
         JOIN   p3_goods   g  ON g.good_id  = m.good_id
@@ -2426,9 +2426,10 @@ p3_interactive_buy() {
     [[ -z "$goods_list" ]] && { warn "No market data for $scity."; return; }
 
     # Let user scroll/filter the list
+    clear
     gum style --foreground 33 --bold "🛒  BUY GOODS — $scity  |  💰 ${gold}g  |  🚢 free cargo: ${cargo_free}"
     echo
-    gum style --foreground 244 "  $(printf '%-14s  %-18s %-18s %-11s' 'GOOD' 'ASK' 'BID' 'STOCK')"
+    gum style --foreground 244 "  $(printf '%-14s  %-16s %-16s %-10s %s' 'GOOD' 'ASK' 'BID' 'STOCK' 'SIG')"
     echo
 
     local chosen_line
@@ -2440,64 +2441,56 @@ p3_interactive_buy() {
             --indicator "→")
     [[ -z "$chosen_line" ]] && return
 
-    # Extract good name (first 14 chars, trimmed)
+    # Extract good name (first word)
     local good
     good=$(echo "$chosen_line" | awk '{print $1}')
     [[ -z "$good" ]] && return
 
     # Fetch market data for this good
-    local ask bid stock
+    local ask bid stock elast_buy stock_ref
     {
-        read -r ask; read -r bid; read -r stock
+        read -r ask; read -r bid; read -r stock; read -r elast_buy; read -r stock_ref
     } < <(p3_psql --tuples-only -c "
-        SELECT m.current_buy::text, m.current_sell::text, m.stock::text
+        SELECT m.current_buy::text,
+               m.current_sell::text,
+               m.stock::text,
+               e.elasticity_buy::text,
+               e.stock_ref::text
         FROM p3_market m
-        JOIN p3_cities ci ON ci.city_id = m.city_id AND ci.name = '$scity'
-        JOIN p3_goods  g  ON g.good_id  = m.good_id AND g.name = '$good'
+        JOIN p3_cities        ci ON ci.city_id = m.city_id AND ci.name = '$scity'
+        JOIN p3_goods          g ON g.good_id  = m.good_id AND g.name  = '$good'
+        JOIN p3_good_elasticity e ON e.good_id = g.good_id
         LIMIT 1;" 2>/dev/null | sed 's/|/\n/g; s/^ *//; s/ *$//' \
-        || printf '0\n0\n0\n')
+        || printf '0\n0\n0\n0.5\n80\n')
 
-    # Show marginal price curve (buy 1–20 units)
+    # Compute marginal curve in bash — one row per unit qty 1..20
+    # mid = (ask/1.08 + bid/0.92) / 2
+    # unit_ask(q) = mid * (stock_ref / max(stock - q + 1, 1))^elast_buy * 1.08
+    # running total = sum of unit_ask(1..q)
     clear
     gum style --foreground 212 --bold "📈  MARGINAL PRICE CURVE — $good in $scity"
     gum style --foreground 244 "    Current ASK: ${ask}g  |  BID: ${bid}g  |  Stock: ${stock}  |  Your gold: ${gold}g"
     echo
-    gum style --foreground 244 "  $(printf '%-6s %-12s %-12s %s' 'QTY' 'UNIT PRICE' 'TOTAL COST' 'AFFORDABLE?')"
-    p3_psql --tuples-only -c "
-        SELECT '  ' ||
-               LPAD(gs.qty::text, 4) || '   ' ||
-               RPAD(ROUND(
-                   (($ask/1.08 + $bid/0.92)/2.0)
-                   * POWER(
-                       e.stock_ref::NUMERIC
-                       / GREATEST($stock - gs.qty + 1, 1)::NUMERIC,
-                       e.elasticity_buy
-                   ) * 1.08,
-               2)::text, 11) ||
-               '  ' ||
-               RPAD(ROUND(
-                   SUM(
-                       (($ask/1.08 + $bid/0.92)/2.0)
-                       * POWER(
-                           e.stock_ref::NUMERIC
-                           / GREATEST($stock - generate_series(1,gs.qty) + 1, 1)::NUMERIC,
-                           e.elasticity_buy
-                       ) * 1.08
-                   ) OVER (ORDER BY gs.qty),
-               2)::text, 12) ||
-               CASE WHEN $gold >= SUM(
-                   (($ask/1.08 + $bid/0.92)/2.0)
-                   * POWER(
-                       e.stock_ref::NUMERIC
-                       / GREATEST($stock - generate_series(1,gs.qty) + 1, 1)::NUMERIC,
-                       e.elasticity_buy
-                   ) * 1.08
-               ) OVER (ORDER BY gs.qty)
-               THEN '✓' ELSE '✗ over budget' END
-        FROM generate_series(1,20) AS gs(qty)
-        JOIN p3_good_elasticity e ON e.good_id = (
-            SELECT good_id FROM p3_goods WHERE name = '$good')
-        ORDER BY gs.qty;" 2>/dev/null | grep -v '^\s*$' | cat
+    printf '  %-6s  %-12s  %-14s  %s\n' "QTY" "UNIT PRICE" "TOTAL COST" "AFFORDABLE?"
+
+    local running_total=0
+    local i
+    for i in $(seq 1 20); do
+        local unit_price total_now affordable
+        unit_price=$(awk -v ask="$ask" -v bid="$bid" -v stk="$stock" \
+                         -v sref="$stock_ref" -v e="$elast_buy" -v q="$i" '
+            BEGIN {
+                mid = (ask/1.08 + bid/0.92) / 2.0
+                denom = stk - q + 1
+                if (denom < 1) denom = 1
+                printf "%.2f", mid * (sref/denom)^e * 1.08
+            }')
+        running_total=$(awk -v rt="$running_total" -v up="$unit_price" \
+            'BEGIN { printf "%.2f", rt + up }')
+        affordable=$(awk -v gold="$gold" -v tot="$running_total" \
+            'BEGIN { print (gold+0 >= tot+0) ? "✓" : "✗ over budget" }')
+        printf '  %-6s  %-12s  %-14s  %s\n' "$i" "${unit_price}g" "${running_total}g" "$affordable"
+    done
     echo
 
     # Ask quantity
@@ -2505,21 +2498,20 @@ p3_interactive_buy() {
     qty=$(gum input --placeholder "How many units to buy? (0 to cancel)" --value "")
     [[ -z "$qty" || ! "$qty" =~ ^[0-9]+$ || "$qty" == "0" ]] && { warn "Purchase cancelled."; return; }
 
-    # Compute final total cost via marginal pricing
-    local total_cost
-    total_cost=$(p3_psql --tuples-only -c "
-        SELECT ROUND(SUM(
-            (($ask/1.08 + $bid/0.92)/2.0)
-            * POWER(
-                e.stock_ref::NUMERIC
-                / GREATEST($stock - gs.qty + 1, 1)::NUMERIC,
-                e.elasticity_buy
-            ) * 1.08
-        ), 2)
-        FROM generate_series(1,$qty) AS gs(qty)
-        JOIN p3_good_elasticity e ON e.good_id = (
-            SELECT good_id FROM p3_goods WHERE name = '$good');" \
-        2>/dev/null | tr -d ' ' || echo "0")
+    # Compute precise total cost for the chosen qty
+    local total_cost=0
+    for i in $(seq 1 "$qty"); do
+        local up
+        up=$(awk -v ask="$ask" -v bid="$bid" -v stk="$stock" \
+                 -v sref="$stock_ref" -v e="$elast_buy" -v q="$i" '
+            BEGIN {
+                mid = (ask/1.08 + bid/0.92) / 2.0
+                denom = stk - q + 1
+                if (denom < 1) denom = 1
+                printf "%.2f", mid * (sref/denom)^e * 1.08
+            }')
+        total_cost=$(awk -v tc="$total_cost" -v up="$up" 'BEGIN { printf "%.2f", tc + up }')
+    done
 
     echo
     gum style --foreground 33 --bold "  SUMMARY: Buy $qty × $good in $scity"
@@ -2547,9 +2539,9 @@ p3_interactive_sell() {
     cargo_list=$(p3_psql --tuples-only -c "
         SELECT RPAD(g.name, 14) ||
                '  ABOARD:' || RPAD(c.quantity::text, 7) ||
-               'BID:'     || RPAD(m.current_sell::text, 9) ||
-               'STOCK:'   || RPAD(m.stock::text, 6) ||
-               'EST.VALUE:' || ROUND(m.current_sell * c.quantity, 2) || 'g'
+               'BID:'      || RPAD(m.current_sell::text, 9) ||
+               'STK:'      || RPAD(m.stock::text, 6) ||
+               'EST:'      || ROUND(m.current_sell * c.quantity, 2) || 'g'
         FROM   p3_cargo c
         JOIN   p3_goods  g  ON g.good_id  = c.good_id
         JOIN   p3_ships  s  ON s.ship_id  = c.ship_id AND s.ship_id = $sid
@@ -2563,9 +2555,10 @@ p3_interactive_sell() {
         return
     fi
 
+    clear
     gum style --foreground 214 --bold "💰  SELL GOODS — $scity  |  Your gold: ${gold}g"
     echo
-    gum style --foreground 244 "  $(printf '%-14s  %-16s %-18s %-11s %s' 'GOOD' 'ABOARD' 'BID' 'STOCK' 'EST.VALUE')"
+    gum style --foreground 244 "  $(printf '%-14s  %-14s %-16s %-10s %s' 'GOOD' 'ABOARD' 'BID' 'STOCK' 'EST.VALUE')"
     echo
 
     local chosen_line
@@ -2581,78 +2574,76 @@ p3_interactive_sell() {
     good=$(echo "$chosen_line" | awk '{print $1}')
     [[ -z "$good" ]] && return
 
-    # Fetch market + cargo data
-    local ask bid stock aboard
+    # Fetch market + cargo + elasticity data in one shot
+    local ask bid stock aboard elast_sell stock_ref
     {
         read -r ask; read -r bid; read -r stock; read -r aboard
+        read -r elast_sell; read -r stock_ref
     } < <(p3_psql --tuples-only -c "
-        SELECT m.current_buy::text, m.current_sell::text, m.stock::text,
-               COALESCE(c.quantity, 0)::text
+        SELECT m.current_buy::text,
+               m.current_sell::text,
+               m.stock::text,
+               COALESCE(c.quantity, 0)::text,
+               e.elasticity_sell::text,
+               e.stock_ref::text
         FROM p3_market m
-        JOIN p3_cities ci ON ci.city_id = m.city_id AND ci.name = '$scity'
-        JOIN p3_goods  g  ON g.good_id  = m.good_id AND g.name = '$good'
-        LEFT JOIN p3_cargo c ON c.good_id = m.good_id AND c.ship_id = $sid
+        JOIN p3_cities        ci ON ci.city_id = m.city_id AND ci.name = '$scity'
+        JOIN p3_goods          g ON g.good_id  = m.good_id AND g.name  = '$good'
+        JOIN p3_good_elasticity e ON e.good_id = g.good_id
+        LEFT JOIN p3_cargo     c ON c.good_id  = m.good_id AND c.ship_id = $sid
         LIMIT 1;" 2>/dev/null | sed 's/|/\n/g; s/^ *//; s/ *$//' \
-        || printf '0\n0\n0\n0\n')
+        || printf '0\n0\n0\n0\n0.5\n80\n')
 
-    # Show marginal sell price curve (sell 1–20 units)
+    # Build marginal sell curve in bash
+    # Selling increases city stock → price falls further with each unit
+    # unit_bid(q) = mid * (stock_ref / max(stock + q, 1))^elast_sell * 0.92
     clear
     gum style --foreground 214 --bold "📉  MARGINAL SELL CURVE — $good in $scity"
-    gum style --foreground 244 "    Current BID: ${bid}g  |  ASK: ${ask}g  |  Stock: ${stock}  |  Aboard: ${aboard}"
+    gum style --foreground 244 "    Current BID: ${bid}g  |  ASK: ${ask}g  |  City stock: ${stock}  |  Aboard: ${aboard}"
     echo
-    gum style --foreground 244 "  $(printf '%-6s %-12s %-14s' 'QTY' 'UNIT PRICE' 'TOTAL REVENUE')"
-    p3_psql --tuples-only -c "
-        SELECT '  ' ||
-               LPAD(gs.qty::text, 4) || '   ' ||
-               RPAD(ROUND(
-                   (($ask/1.08 + $bid/0.92)/2.0)
-                   * POWER(
-                       e.stock_ref::NUMERIC
-                       / GREATEST($stock + gs.qty, 1)::NUMERIC,
-                       e.elasticity_sell
-                   ) * 0.92,
-               2)::text, 11) ||
-               '  ' ||
-               ROUND(
-                   SUM(
-                       (($ask/1.08 + $bid/0.92)/2.0)
-                       * POWER(
-                           e.stock_ref::NUMERIC
-                           / GREATEST($stock + generate_series(1,gs.qty), 1)::NUMERIC,
-                           e.elasticity_sell
-                       ) * 0.92
-                   ) OVER (ORDER BY gs.qty),
-               2)::text
-        FROM generate_series(1,20) AS gs(qty)
-        JOIN p3_good_elasticity e ON e.good_id = (
-            SELECT good_id FROM p3_goods WHERE name = '$good')
-        ORDER BY gs.qty;" 2>/dev/null | grep -v '^\s*$' | cat
+    printf '  %-6s  %-12s  %s\n' "QTY" "UNIT PRICE" "TOTAL REVENUE"
+
+    local running_total=0
+    local i
+    for i in $(seq 1 20); do
+        local unit_price
+        unit_price=$(awk -v ask="$ask" -v bid="$bid" -v stk="$stock" \
+                         -v sref="$stock_ref" -v e="$elast_sell" -v q="$i" '
+            BEGIN {
+                mid = (ask/1.08 + bid/0.92) / 2.0
+                denom = stk + q
+                if (denom < 1) denom = 1
+                printf "%.2f", mid * (sref/denom)^e * 0.92
+            }')
+        running_total=$(awk -v rt="$running_total" -v up="$unit_price" \
+            'BEGIN { printf "%.2f", rt + up }')
+        printf '  %-6s  %-12s  %s\n' "$i" "${unit_price}g" "${running_total}g"
+    done
     echo
 
     local qty
     qty=$(gum input --placeholder "How many units to sell? (max ${aboard}, 0 to cancel)" --value "")
     [[ -z "$qty" || ! "$qty" =~ ^[0-9]+$ || "$qty" == "0" ]] && { warn "Sale cancelled."; return; }
 
-    # Compute total revenue via marginal pricing
-    local total_revenue
-    total_revenue=$(p3_psql --tuples-only -c "
-        SELECT ROUND(SUM(
-            (($ask/1.08 + $bid/0.92)/2.0)
-            * POWER(
-                e.stock_ref::NUMERIC
-                / GREATEST($stock + gs.qty, 1)::NUMERIC,
-                e.elasticity_sell
-            ) * 0.92
-        ), 2)
-        FROM generate_series(1,$qty) AS gs(qty)
-        JOIN p3_good_elasticity e ON e.good_id = (
-            SELECT good_id FROM p3_goods WHERE name = '$good');" \
-        2>/dev/null | tr -d ' ' || echo "0")
+    # Compute precise total revenue for chosen qty
+    local total_revenue=0
+    for i in $(seq 1 "$qty"); do
+        local up
+        up=$(awk -v ask="$ask" -v bid="$bid" -v stk="$stock" \
+                 -v sref="$stock_ref" -v e="$elast_sell" -v q="$i" '
+            BEGIN {
+                mid = (ask/1.08 + bid/0.92) / 2.0
+                denom = stk + q
+                if (denom < 1) denom = 1
+                printf "%.2f", mid * (sref/denom)^e * 0.92
+            }')
+        total_revenue=$(awk -v tr="$total_revenue" -v up="$up" 'BEGIN { printf "%.2f", tr + up }')
+    done
 
     echo
     gum style --foreground 214 --bold "  SUMMARY: Sell $qty × $good in $scity"
     gum style --foreground 244 "  Unit range: ${bid}g (1st unit) → marginal pricing applied"
-    gum style --foreground 76  "  Total revenue: ${total_revenue}g  |  Your gold after: $(awk "BEGIN{printf \"%.2f\", $gold + $total_revenue}")g"
+    gum style --foreground 76  "  Total revenue: ${total_revenue}g  |  Gold after: $(awk "BEGIN{printf \"%.2f\", $gold + $total_revenue}")g"
     echo
 
     if gum confirm --default=false "Confirm sale: $qty × $good for ${total_revenue}g?"; then
@@ -2674,13 +2665,13 @@ patrician_menu() {
         # ── Menu items (shown as preview, filtered with gum filter) ────────
         local _all_items
         _all_items="$(printf '%s\n' \
+            "[Trade]  Buy Goods at City" \
+            "[Trade]  Sell Goods at City" \
             "[Fleet]  View Fleet" \
             "[Fleet]  Buy a Ship" \
             "[Fleet]  Rename Ship" \
             "[Fleet]  Give Sail Order" \
             "[Fleet]  View Ship Cargo" \
-            "[Trade]  Buy Goods at City" \
-            "[Trade]  Sell Goods at City" \
             "[Presence]  Establish Counting House" \
             "[Presence]  View My Counting Houses" \
             "[Buildings]  🏭 Manage Buildings & Limit Orders" \
