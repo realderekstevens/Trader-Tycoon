@@ -3,7 +3,6 @@
 > A historically grounded medieval trade simulation set in the Hanseatic League, c. 1300.  
 > Play as a Lübeck merchant, build a fleet, establish counting houses, and dominate Baltic trade.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Flutter](https://img.shields.io/badge/Flutter-3.x-blue.svg)](https://flutter.dev)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14+-336791.svg)](https://postgresql.org)
 [![Shell](https://img.shields.io/badge/Shell-bash-green.svg)]()
@@ -38,7 +37,6 @@ with a PostgreSQL backend.
 patrician3/
 ├── app.sh                  # Main CLI entry point (sources patrician3.sh)
 ├── patrician3.sh           # Core game engine — schema, seed, menus, tick daemon
-├── npc_ships.sh            # NPC ship AI — automated inter-city trade fleets
 ├── patrician3_app/         # Flutter cross-platform frontend
 │   ├── lib/
 │   │   ├── main.dart           # App root, navigation, PostgREST client
@@ -67,35 +65,35 @@ patrician3/
 | Tool | Version | Notes |
 |------|---------|-------|
 | PostgreSQL | 14+ | `generated columns` required for `p3_hex_tiles.s` |
-| [gum](https://github.com/charmbracelet/gum) | any | TUI prompts (`brew install gum`) |
+| [gum](https://github.com/charmbracelet/gum) | any | TUI prompts (`yay -S gum` for Arch Linux) |
 | Flutter SDK | 3.x | For the Flutter frontend |
-| bash | 4+ | macOS ships bash 3; use `brew install bash` |
 
 ### CLI Edition
 
 ```bash
 # 1. Clone and configure
-git clone https://github.com/yourname/patrician3.git
-cd patrician3
+git clone https://github.com/realderekstevens/Trader-Tycoon
+cd Trader-Tycoon
+chmod +x app.sh
+./app.sh
 
-# 2. Set your database connection (or export before running)
+# 2. Set your database connection (Not required, but you can change it to your desired database name)
 export PSQL_DB=traderdude
 export PSQL_USER=postgres
 
-# 3. Run — first-time setup is in the Initialise / Reset Game menu
-./app.sh
-
-# 4. In the game: Setup → Initialise / Reset Game → confirm
+# 3. In the game: Setup → Initialise / Reset Game → confirm
 #    Then: Simulation → Start Auto-Tick to begin the live economy
+#    Or keep it as turn-based if you're more into strategy
 ```
 
-### Flutter Frontend
+### Flutter Frontend ### UNDER CONSTRUCTION ###
 
 ```bash
 cd patrician3_app
 
 # One-time wiring (run after flutter create . or first clone)
-bash setup.sh
+chmod +x setup.sh
+./bash setup.sh
 
 # Start a PostgREST server pointing at your PostgreSQL database, then:
 flutter run -d linux       # Linux desktop
@@ -284,3 +282,121 @@ MIT — see [LICENSE](LICENSE).
 - [Red Blob Games — Hex Grids](https://www.redblobgames.com/grids/hexagons/) — coordinate system
 - [Hanseatic League — Wikipedia](https://en.wikipedia.org/wiki/Hanseatic_League) — historical context
 - [Patrician III (2003, Ascaron)](https://en.wikipedia.org/wiki/Patrician_III) — gameplay inspiration
+
+# Changelog
+
+All notable changes to Patrician III/IV are documented here.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+---
+
+## [Unreleased]
+
+### Added
+- **NPC ship AI** (`npc_ships.sh`) — 13 automated merchant ships across Hanseatic + Mediterranean routes, each specialised in one good; buys from surplus cities, sells to deficit cities, moves market prices just as player trades do
+- **Player visibility / fog of war** (`visibility.sql`) — market prices now only visible in cities where the player has a docked ship or counting house; Lübeck home city always visible
+- **Counting houses** (`p3_counting_houses` table) — establish permanent market presence in a city
+- **Admin privilege system** — `p3_player.is_admin` flag; arbitrage views and NPC logs gated behind admin check; global market view restricted to admins
+- **`p3_visible_market_view`** — player-filtered market view (replaces raw `p3_market_view` for player-facing queries)
+- **`p3_lubeck_market_view`** — always-available Lübeck market snapshot for dashboard display
+- **`p3_admin_arbitrage_view`** — renamed from `p3_arbitrage_view`; explicit admin-only intent
+- **`p3_admin_crossleague_view`** — cross-league arbitrage, admin-only
+- **Flutter frontend refactor** (`main.dart`) — Riverpod state management, Hanseatic dark theme, proper error handling, visibility-aware market tab, admin-only arbitrage panel, responsive rail + bottom nav layout
+- `p3_counting_house_cost()` SQL function — cost scales with city population
+- `p3_player_visible_city_ids()` SQL function — returns set of cities player can see
+
+### Changed
+- Dashboard now shows **Lübeck market prices** for non-admin players instead of arbitrage table
+- Arbitrage opportunities hidden from players; shown only to admins in a clearly labelled admin card
+- Flutter app now uses a centralised `PostgRestService` class instead of scattered fetch calls
+
+---
+
+## [0.1.0] — Initial Release
+
+### Added
+- Full Hanseatic + Mediterranean schema (§14a): 15 tables, 5 views, 4 SQL functions
+- 28 goods with per-unit marginal elasticity pricing model
+- 24 Hanseatic cities + 10 Mediterranean cities on pointy-top hex grid
+- 6 ship types: Snaikka, Crayer, Hulk, Cog, Galley, Carrack
+- 24 building types with daily production and maintenance costs
+- Real-time tick daemon with `pg_notify` and `LISTEN p3_day_tick`
+- Route system with standing orders and limit orders
+- Seasonal price curves, panic/glut non-linearity, bid/ask spread
+- Flutter app: PostgREST integration, hex map screen, basic market view
+
+---
+
+# Contributing
+
+Contributions are welcome. Please read the guidelines below before opening a pull request.
+
+## Development Setup
+
+```bash
+git clone https://github.com/yourname/patrician3.git
+cd patrician3
+
+# Create a local PostgreSQL database
+createdb traderdude
+
+# Run the game once to initialise the schema
+PSQL_DB=traderdude ./app.sh
+# → Setup → Initialise / Reset Game
+```
+
+## What to Contribute
+
+**High-value areas:**
+
+| Area | Examples |
+|------|---------|
+| Historical accuracy | Fix city coordinates, population, production roles |
+| Balance tuning | Elasticity values, daily production rates, building costs |
+| NPC AI | Smarter route selection, NPC factions with personalities |
+| Flutter UI | Hex map renderer, price history charts, trade log view |
+| New content | Additional ship types, building types, goods (historical sources required) |
+| Testing | PostgreSQL function tests, Flutter widget tests |
+
+## Pull Request Guidelines
+
+1. **One feature / fix per PR** — keep diffs small and reviewable
+2. **SQL changes** — include both forward migration and rollback in `sql/`
+3. **Historical citations** — if adding or changing game data (prices, production, city populations), link a source
+4. **Flutter** — run `flutter analyze` and `flutter test` before submitting
+5. **Shell** — run `shellcheck app.sh patrician3.sh npc_ships.sh` (warnings are acceptable; errors are not)
+6. **Commit messages** — use present tense imperative: `Add counting house UI`, `Fix NPC ETA calculation`
+
+## Reporting Bugs
+
+Open a GitHub Issue with:
+- Steps to reproduce
+- Expected vs actual behaviour
+- PostgreSQL version (`psql --version`)
+- Flutter version if relevant (`flutter --version`)
+
+## Game Balance Philosophy
+
+- Prices should create **meaningful trade decisions** — not trivially obvious routes
+- NPC ships should **stabilise markets**, not dominate them
+- Player buildings should **pay for themselves in 30–90 days** at normal trade rates
+- The Hanseatic economy should feel **tighter and denser** than the Mediterranean expansion
+
+## Code Style
+
+**Bash:**
+- 4-space indentation
+- Local variables declared with `local`
+- Heredocs for SQL blocks (`<<'SQL' … SQL`)
+- `set -e` in all standalone scripts
+
+**SQL:**
+- UPPER CASE keywords
+- Table aliases: `ci` = cities, `g` = goods, `m` = market, `s` = ships
+- All new tables: `p3_` prefix
+- All new views: `p3_` prefix; admin views: `p3_admin_` prefix
+
+**Dart/Flutter:**
+- Follow `flutter analyze` rules
+- Riverpod for all async state (no raw `setState` for server data)
+- `PatricianTheme` constants for all colours — no raw `Color(0x...)` in widgets
