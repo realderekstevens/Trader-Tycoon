@@ -2199,7 +2199,6 @@ p3_main_dashboard() {
     # Buildings — compact
     local lub_bldg_lines
     lub_bldg_lines=$(p3_psql --tuples-only -c "
-        SELECT '  ' || RPAD(bt.name, 18) || '×' || pb.num_buildings ||
         SELECT '  ' || RPAD(bt.name, 18) || 'x' || pb.num_buildings ||
                '  -> ' || g_out.name || '  (' || bt.daily_maintenance*pb.num_buildings || 'g/day maint)'
         FROM p3_player_buildings pb
