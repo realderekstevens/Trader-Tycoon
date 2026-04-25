@@ -1,204 +1,161 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  scripts/latlon_to_hex.sh  —  Hex coordinate tool for Patrician III / IV
+#  scripts/latlon_to_hex.sh  —  Compute hex (q, r) from city lat/lon in DB
 #
-#  The VERIFIED array holds every city's manually-placed hex coordinate from
-#  seed.sql — those values are the ground truth and are output exactly as-is.
+#  Reads latitude + longitude directly from p3_cities (already inserted by
+#  seed.sql), runs the pointy-top axial projection in awk, then writes q and r
+#  back to the DB.  No coordinates are hardcoded here.
 #
-#  The NEW_CITIES array is where you add fresh cities.  Each entry is computed
-#  from real-world lat/lon using the same pointy-top axial projection as the
-#  rest of the grid (Lübeck anchor, 1 hex ≈ 50 nm).  After running --new,
-#  eyeball the output against neighbouring known cities and tweak q by hand
-#  if needed — the r (latitude) value will be accurate; q (longitude) may be
-#  off by 1-3 hexes for Atlantic/Mediterranean cities due to the map's
-#  intentional east-west stretching.
+#  Projection constants (reverse-engineered from the Hanseatic city cluster):
+#    Anchor : Lübeck  53.8655°N  10.6866°E  →  hex (0, 0)
+#    HEX_SIZE   = 0.55  (degrees of latitude per hex radius, ≈ 50 nm)
+#    COS_LAT_DEG= 53.0  (central latitude for E/W cosine correction)
+#
+#  r (latitude axis) is geographically accurate to ±1 hex.
+#  q (longitude axis) is accurate for the Baltic cluster; Atlantic and
+#  Mediterranean cities may be off by 1-3 hexes — adjust manually if needed.
 #
 #  Usage
 #  ──────
-#    ./latlon_to_hex.sh                # SQL UPDATE for ALL verified cities
-#    ./latlon_to_hex.sh --new          # SQL UPDATE for NEW_CITIES only (computed)
-#    ./latlon_to_hex.sh --all          # SQL UPDATE for verified + new combined
-#    ./latlon_to_hex.sh --csv          # CSV dump of all verified coordinates
-#    ./latlon_to_hex.sh --check        # Print verified table (no DB needed)
+#    ./latlon_to_hex.sh                        # apply to DB (default)
+#    ./latlon_to_hex.sh --dry-run              # print SQL without applying
+#    ./latlon_to_hex.sh --csv                  # print name,q,r,lat,lon to stdout
+#
+#  Environment (inherits from app.sh, or set manually)
+#    P3_USER   postgres user  (default: postgres)
+#    P3_DB     database name  (default: traderdude)
 # =============================================================================
 
-# ── PROJECTION CONFIG ─────────────────────────────────────────────────────────
-# These constants are reverse-engineered from the manually-placed seed values.
-# Do not change them unless you're rebuilding the whole grid from scratch.
-readonly ANCHOR_LAT=53.8655   # Lübeck — hex (0,0)
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+P3_USER="${P3_USER:-postgres}"
+P3_DB="${P3_DB:-traderdude}"
+
+readonly ANCHOR_LAT=53.8655
 readonly ANCHOR_LON=10.6866
-readonly HEX_SIZE=0.55        # degrees latitude per hex (≈ 50 nm)
-readonly COS_LAT_DEG=53.0     # central latitude for E/W cosine correction
+readonly HEX_SIZE=0.55
+readonly COS_LAT_DEG=53.0
 
-# ── VERIFIED COORDINATES  (exact values from seed.sql) ───────────────────────
-# Format: "City Name|q|r"
-# These are output verbatim — the formula is NOT applied to them.
-VERIFIED=(
-# Hanseatic — Baltic core
-    "Lubeck|0|0"
-    "Hamburg|-1|0"
-    "Rostock|1|0"
-    "Stettin|3|1"
-    "Gdansk|6|-1"
-    "Riga|9|-4"
-    "Reval|10|-7"
-    "Novgorod|15|-6"
-    "Stockholm|5|-7"
-    "Visby|5|-5"
-    "Malmo|2|-2"
-    "Torun|6|1"
-# Hanseatic — North Sea / Scandinavia
-    "Bergen|-4|-8"
-    "Oslo|0|-7"
-    "Aalborg|-1|-4"
-    "Ribe|-1|-2"
-# Hanseatic — British Isles
-    "Scarborough|-8|0"
-    "Edinburgh|-10|-3"
-    "London|-8|3"
-# Hanseatic — Rhine / Low Countries
-    "Brugge|-5|3"
-    "Groningen|-3|1"
-    "Bremen|-1|1"
-    "Cologne|-3|4"
-# Hanseatic — East
-    "Ladoga|15|-7"
-# Mediterranean
-    "Venice|1|10"
-    "Genoa|-1|11"
-    "Marseille|-4|13"
-    "Barcelona|-6|15"
-    "Lisbon|-14|18"
-    "Constantinople|13|15"
-    "Naples|3|16"
-    "Palermo|2|19"
-    "Tunis|0|20"
-    "Alexandria|14|27"
-)
+# ── Fetch cities from DB ───────────────────────────────────────────────────────
+fetch_cities() {
+    psql -X -t -A --field-separator='|' \
+        --username="$P3_USER" --dbname="$P3_DB" \
+        --command="SELECT name, latitude, longitude
+                     FROM p3_cities
+                    WHERE latitude IS NOT NULL
+                      AND longitude IS NOT NULL
+                    ORDER BY name;"
+}
 
-# ── NEW CITIES  (add here — formula will compute q, r from lat/lon) ───────────
-# Format: "City Name|lat|lon"
-# After running --new, check output visually and hand-correct q if needed.
-NEW_CITIES=(
-# Example (uncomment to use):
-# "Danzig|54.35|18.65"
-# "Bruges|51.21|3.22"
-)
+# ── Core projection (awk) ──────────────────────────────────────────────────────
+compute_hex() {
+    # stdin:  name|lat|lon
+    # stdout: name|q|r|lat|lon
+    local cos_lat
+    cos_lat=$(awk -v d="$COS_LAT_DEG" \
+        'BEGIN { printf "%.10f", cos(d * 3.141592653589793 / 180) }')
 
-# ── FORMULA ───────────────────────────────────────────────────────────────────
+    awk -v alat="$ANCHOR_LAT" -v alon="$ANCHOR_LON" \
+        -v coslat="$cos_lat"  -v size="$HEX_SIZE"   \
+        -F'|' '
+    {
+        name = $1; lat = $2; lon = $3
 
-COS_LAT=$(awk -v d="$COS_LAT_DEG" \
-    'BEGIN{printf "%.10f", cos(d*3.141592653589793/180)}')
+        # lat/lon delta → flat x, y  (y positive = south)
+        y = alat - lat
+        x = (lon - alon) * coslat
 
-_latlon_to_hex() {
-    # args: name lat lon
-    # prints: name|q|r
-    awk -v name="$1" -v lat="$2" -v lon="$3" \
-        -v alat="$ANCHOR_LAT" -v alon="$ANCHOR_LON" \
-        -v coslat="$COS_LAT"  -v size="$HEX_SIZE" '
-    BEGIN {
-        y = alat - lat                    # positive = south
-        x = (lon - alon) * coslat        # cosine-corrected E/W
-
-        # flat x,y → fractional axial (pointy-top)
-        fq = (sqrt(3)/3 * x - 1/3 * y) / size
-        fr = (2/3 * y) / size
+        # flat x,y → fractional axial  (pointy-top hex)
+        fq = (sqrt(3)/3 * x - 1.0/3 * y) / size
+        fr = (2.0/3 * y) / size
 
         # axial → cube
         cx = fq; cz = fr; cy = -cx - cz
 
-        # cube rounding (Red Blob Games)
-        rx = int(cx + (cx>=0 ? 0.5 : -0.5))
-        ry = int(cy + (cy>=0 ? 0.5 : -0.5))
-        rz = int(cz + (cz>=0 ? 0.5 : -0.5))
-        dx = (rx-cx); if(dx<0) dx=-dx
-        dy = (ry-cy); if(dy<0) dy=-dy
-        dz = (rz-cz); if(dz<0) dz=-dz
-        if      (dx>dy && dx>dz) rx = -ry-rz
-        else if (dy>dz)          ry = -rx-rz
-        else                     rz = -rx-ry
+        # cube rounding  (Red Blob Games)
+        rx = int(cx + (cx >= 0 ? 0.5 : -0.5))
+        ry = int(cy + (cy >= 0 ? 0.5 : -0.5))
+        rz = int(cz + (cz >= 0 ? 0.5 : -0.5))
+        dx = (rx-cx); if (dx < 0) dx = -dx
+        dy = (ry-cy); if (dy < 0) dy = -dy
+        dz = (rz-cz); if (dz < 0) dz = -dz
+        if      (dx > dy && dx > dz) rx = -ry - rz
+        else if (dy > dz)            ry = -rx - rz
+        else                         rz = -rx - ry
 
-        printf "%s|%d|%d\n", name, rx, rz
+        q = rx; r = rz
+        printf "%s|%d|%d|%s|%s\n", name, q, r, lat, lon
     }'
 }
 
-_sql_block() {
-    # args: array of "name|q|r" entries, optional comment header
-    local -n _arr="$1"
-    local header="${2:-}"
-    [[ -n "$header" ]] && echo "-- $header"
-    echo "WITH city_coords (city_name, q, r) AS (VALUES"
-    local first=1
-    for entry in "${_arr[@]}"; do
-        IFS="|" read -r name q r <<< "$entry"
-        if [[ $first -eq 1 ]]; then
-            printf "    ('%s', %d, %d)\n" "$name" "$q" "$r"
-            first=0
-        else
-            printf "   ,('%s', %d, %d)\n" "$name" "$q" "$r"
-        fi
+# ── Build SQL ──────────────────────────────────────────────────────────────────
+build_sql() {
+    # stdin: lines of name|q|r|lat|lon
+    # stdout: SQL to UPDATE p3_cities then bootstrap p3_hex_tiles
+    local rows=()
+    while IFS='|' read -r name q r lat lon; do
+        rows+=("    ('$name', $q, $r)")
     done
-    echo ")"
-    echo "UPDATE p3_cities ci"
-    echo "    SET hex_q = cc.q, hex_r = cc.r"
-    echo "    FROM city_coords cc"
-    echo "    WHERE ci.name = cc.city_name;"
+
+    cat <<SQL
+-- Auto-generated by scripts/latlon_to_hex.sh
+-- Anchor: Lübeck ($ANCHOR_LAT, $ANCHOR_LON) = hex (0,0)
+-- HEX_SIZE=$HEX_SIZE  COS_LAT_DEG=$COS_LAT_DEG
+
+WITH city_coords (city_name, q, r) AS (VALUES
+$(IFS=,$'\n'; printf '%s\n' "${rows[*]}")
+)
+UPDATE p3_cities ci
+   SET hex_q = cc.q,
+       hex_r = cc.r
+  FROM city_coords cc
+ WHERE ci.name = cc.city_name;
+
+-- Bootstrap p3_hex_tiles for every city hex
+INSERT INTO p3_hex_tiles (q, r, terrain, city_id)
+SELECT
+    ci.hex_q,
+    ci.hex_r,
+    CASE WHEN ci.name IN (
+        'Novgorod', 'Groningen', 'Bremen', 'Cologne', 'Torun', 'Ladoga',
+        'Constantinople', 'Alexandria', 'Tunis'
+    ) THEN 'land' ELSE 'coast' END,
+    ci.city_id
+FROM p3_cities ci
+WHERE ci.hex_q IS NOT NULL
+ON CONFLICT (q, r) DO UPDATE
+    SET city_id = EXCLUDED.city_id,
+        terrain  = EXCLUDED.terrain;
+SQL
 }
 
-# ── OUTPUT MODES ──────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
+MODE="${1:---apply}"
 
-MODE="${1:---sql}"
+RAW="$(fetch_cities)"
+if [[ -z "$RAW" ]]; then
+    echo "ERROR: No cities found in p3_cities. Has seed.sql been applied?" >&2
+    exit 1
+fi
+
+COMPUTED="$(echo "$RAW" | compute_hex)"
 
 case "$MODE" in
-
     --csv)
-        echo "name,q,r"
-        for entry in "${VERIFIED[@]}"; do
-            IFS="|" read -r name q r <<< "$entry"
-            echo "$name,$q,$r"
-        done
+        echo "name,q,r,lat,lon"
+        echo "$COMPUTED" | awk -F'|' '{print $1","$2","$3","$4","$5}'
         ;;
-
-    --check)
-        printf "%-18s  %6s  %6s  %6s\n" "City" "q" "r" "s"
-        printf "%-18s  %6s  %6s  %6s\n" "──────────────────" "──────" "──────" "──────"
-        for entry in "${VERIFIED[@]}"; do
-            IFS="|" read -r name q r <<< "$entry"
-            s=$(( -q - r ))
-            printf "%-18s  %6d  %6d  %6d\n" "$name" "$q" "$r" "$s"
-        done
-        echo ""
-        echo "${#VERIFIED[@]} verified cities"
+    --dry-run)
+        echo "$COMPUTED" | build_sql
         ;;
-
-    --new)
-        if [[ ${#NEW_CITIES[@]} -eq 0 ]]; then
-            echo "-- No entries in NEW_CITIES array."
-            exit 0
-        fi
-        computed=()
-        for entry in "${NEW_CITIES[@]}"; do
-            IFS="|" read -r name lat lon <<< "$entry"
-            computed+=("$(_latlon_to_hex "$name" "$lat" "$lon")")
-        done
-        echo "-- Computed from lat/lon — verify q visually before committing"
-        _sql_block computed "New cities (formula-placed)"
-        ;;
-
-    --all)
-        # Compute new cities
-        computed=()
-        for entry in "${NEW_CITIES[@]}"; do
-            IFS="|" read -r name lat lon <<< "$entry"
-            computed+=("$(_latlon_to_hex "$name" "$lat" "$lon")")
-        done
-        combined=("${VERIFIED[@]}" "${computed[@]}")
-        echo "-- hex_coords: verified seed values + formula-placed new cities"
-        _sql_block combined "All cities"
-        ;;
-
-    --sql | *)
-        echo "-- hex_coords: verified seed values (manually placed)"
-        _sql_block VERIFIED "Verified coordinates from seed.sql"
+    --apply | *)
+        SQL="$(echo "$COMPUTED" | build_sql)"
+        echo "$SQL" | psql -X \
+            --username="$P3_USER" --dbname="$P3_DB" >/dev/null \
+        && echo "Hex coordinates applied ($(echo "$COMPUTED" | wc -l | tr -d ' ') cities)." \
+        || { echo "ERROR: psql failed." >&2; exit 1; }
         ;;
 esac

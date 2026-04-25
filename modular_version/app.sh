@@ -23,20 +23,19 @@
 #      main_menu.sh      ← patrician_menu (top-level action dispatcher)
 #    sql/
 #      schema.sql        ← CREATE TABLE / VIEW / FUNCTION  (apply with psql -f)
-#      seed.sql          ← INSERT cities, goods, market data (apply with psql -f)
-#      hex_coords.sql    ← SET hex_q/hex_r on cities, bootstrap p3_hex_tiles
+#      seed.sql          ← INSERT cities (with lat/lon), goods, market data
 #    scripts/
-#      latlon_to_hex.sh  ← utility: convert lat/lon → axial hex for new cities
+#      latlon_to_hex.sh  ← reads lat/lon FROM DB → computes q,r → writes back
+#                           (called automatically by p3_setup_all; no hardcoded coords)
 #    tools/
-#      hex_map.jsx       ← browser companion map (React, not sourced by app.sh)
+#      hex_map.jsx       ← browser companion map (React — see README for usage)
 #
-#  DEPENDENCIES: psql  gum
+#  DEPENDENCIES: psql  gum  awk
 #
 #  QUICK START:
 #    psql -d traderdude -f sql/schema.sql
 #    psql -d traderdude -f sql/seed.sql
-#    psql -d traderdude -f sql/hex_coords.sql
-#    bash app.sh
+#    bash app.sh          ← then Admin › Initialise  (runs latlon_to_hex.sh)
 # =============================================================================
 
 # Do NOT use set -e here — gum returns exit 1 on ESC/empty selection, and
@@ -64,6 +63,8 @@ source "$SCRIPT_DIR/screens/main_menu.sh"
 # ─────────────────────────────────────────────────────────────────────────────
 #  Schema bootstrap helpers  (thin wrappers around sql/ files)
 #  The full SQL lives in sql/schema.sql and sql/seed.sql.
+#  Hex coordinates are computed dynamically by scripts/latlon_to_hex.sh
+#  from the lat/lon columns already present in p3_cities after seed.sql runs.
 #  These functions exist so the Admin > Initialise menu still works without
 #  requiring the operator to run psql manually.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,11 +85,8 @@ p3_seed_all() {
 }
 
 p3_apply_hex_coords() {
-    info "Applying hex coordinates from sql/hex_coords.sql..."
-    psql -X --username="$P3_USER" --dbname="$P3_DB" \
-         -f "$SCRIPT_DIR/sql/hex_coords.sql" >/dev/null \
-    && success "Hex coordinates applied." \
-    || error "Hex coords apply failed — check sql/hex_coords.sql."
+    info "Computing hex coordinates from city lat/lon..."
+    bash "$SCRIPT_DIR/scripts/latlon_to_hex.sh" --apply     && success "Hex coordinates computed and applied."     || error "Hex coordinate generation failed — check scripts/latlon_to_hex.sh."
 }
 
 p3_drop_tables() {
