@@ -2200,13 +2200,27 @@ p3_main_dashboard() {
     local lub_bldg_lines
     lub_bldg_lines=$(p3_psql --tuples-only -c "
         SELECT '  ' || RPAD(bt.name, 18) || '×' || pb.num_buildings ||
-               '  → ' || g_out.name || '  (' || bt.daily_maintenance*pb.num_buildings || 'g/day maint)'
+        SELECT '  ' || RPAD(bt.name, 18) || 'x' || pb.num_buildings ||
+               '  -> ' || g_out.name || '  (' || bt.daily_maintenance*pb.num_buildings || 'g/day maint)'
         FROM p3_player_buildings pb
         JOIN p3_building_types bt ON bt.building_type_id = pb.building_type_id
         JOIN p3_cities ci ON ci.city_id = pb.city_id AND ci.name = 'Lübeck'
         JOIN p3_goods g_out ON g_out.good_id = bt.output_good_id
         ORDER BY bt.name;" 2>/dev/null \
         | grep -v '^\s*$' || echo "  none")
+
+    # City-owned (NPC) production facilities — visible from a ship/counting house
+    local lub_city_prod_lines
+    lub_city_prod_lines=$(p3_psql --tuples-only -c "
+        SELECT '  ' || RPAD(g.name, 14) ||
+               RPAD(cg.role, 9) ||
+               RPAD(cg.efficiency::text||'%', 6) ||
+               ROUND(g.base_production * cg.efficiency / 100.0, 3)::text || '/day'
+        FROM p3_city_goods cg
+        JOIN p3_goods  g  ON g.good_id  = cg.good_id
+        JOIN p3_cities ci ON ci.city_id = cg.city_id AND ci.name = 'Lubeck'
+        ORDER BY cg.role DESC, g.name;" 2>/dev/null \
+        | grep -v '^\s*$' || echo "  (no city production data)")
 
     # Nearest cities — inline pairs, fixed 32-char column
     local lub_nearby_lines
@@ -2237,7 +2251,7 @@ p3_main_dashboard() {
         arb_lines=$(p3_psql --tuples-only -c "
             SELECT '  ' || RPAD(good, 13) ||
                            RPAD(buy_city, 15) ||
-                   '→  '|| RPAD(sell_city, 15) ||
+                   '->  '|| RPAD(sell_city, 15) ||
                    '+' || profit_per_unit || '/u'
             FROM p3_admin_arbitrage_view LIMIT 10;" 2>/dev/null \
             | grep -v '^\s*$' || echo "  (no arbitrage data)")
@@ -2273,7 +2287,11 @@ p3_main_dashboard() {
             printf '  %-13s %-9s %-5s %s\n' "GOOD" "ROLE" "EFF" "OUTPUT"
             printf '%s\n' "$lub_prod_lines"
             printf '%s\n' "$ruler_r"
-            printf '🏭  YOUR BUILDINGS IN LÜBECK\n'
+            printf 'CITY PRODUCTION FACILITIES  (city-owned)\n'
+            printf '  %-14s %-9s %-6s %s\n' "GOOD" "ROLE" "EFF" "OUTPUT/DAY"
+            printf '%s\n' "$lub_city_prod_lines"
+            printf '%s\n' "$ruler_r"
+            printf 'YOUR BUILDINGS IN LUBECK\n'
             printf '%s\n' "$lub_bldg_lines"
             printf '%s\n' "$ruler_r"
             printf '🗺  NEAREST CITIES\n'
@@ -2401,8 +2419,93 @@ p3_admin_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  §14i-B  INTERACTIVE BUY — scrollable price list + marginal curve
+#  §14i-B  INTERACTIVE BUY — city intel panel + scrollable price list + marginal curve
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Helper: render a city intel panel (mirrors the Lübeck dashboard) ─────────
+p3_city_intel_panel() {
+    local city="$1"
+    local ruler
+    ruler=$(printf '─%.0s' $(seq 1 74))
+
+    # ── City basics ──────────────────────────────────────────────────────────
+    local ci_pop ci_region ci_league ci_hex ci_ch
+    {
+        read -r ci_pop; read -r ci_region; read -r ci_league
+        read -r ci_hex; read -r ci_ch
+    } < <(p3_psql --tuples-only -c "
+        SELECT ci.population::text, ci.region, ci.league,
+               COALESCE(ci.hex_q::text||','||ci.hex_r::text,'unmapped'),
+               (SELECT COUNT(*)::text FROM p3_counting_houses
+                WHERE city_id = ci.city_id)
+        FROM p3_cities ci WHERE ci.name='$city' LIMIT 1;" 2>/dev/null \
+        | sed 's/|/\n/g; s/^ *//; s/ *$//' \
+        || printf '?\nBaltic\nHanseatic\nunmapped\n0\n')
+
+    # ── City-owned (NPC) production buildings ───────────────────────────────
+    local city_prod_lines
+    city_prod_lines=$(p3_psql --tuples-only -c "
+        SELECT '  ' || RPAD(g.name, 14) ||
+               RPAD(cg.role, 9) ||
+               RPAD(cg.efficiency::text||'%', 6) ||
+               ROUND(g.base_production * cg.efficiency / 100.0, 3)::text || '/day'
+        FROM p3_city_goods cg
+        JOIN p3_goods  g  ON g.good_id  = cg.good_id
+        JOIN p3_cities ci ON ci.city_id = cg.city_id AND ci.name = '$city'
+        ORDER BY cg.role DESC, g.name;" 2>/dev/null \
+        | grep -v '^\s*$' || echo "  (no production data)")
+
+    # ── Ships in port (player + NPC, docked) ────────────────────────────────
+    local ships_in_port
+    ships_in_port=$(p3_psql --tuples-only -c "
+        SELECT '  ' ||
+               RPAD(CASE s.owner WHEN 'player' THEN '[YOU] ' ELSE '[NPC]  ' END || s.name, 22) ||
+               RPAD(s.ship_type, 10) ||
+               RPAD(s.speed_knots::text||'kn', 7) ||
+               'cap:' || s.cargo_cap
+        FROM p3_ships s
+        WHERE s.current_city = '$city' AND s.status = 'docked'
+        ORDER BY s.owner DESC, s.name;" 2>/dev/null \
+        | grep -v '^\s*$' || echo "  (no ships in port)")
+
+    # ── Nearest cities ───────────────────────────────────────────────────────
+    local nearby_lines
+    nearby_lines=$(p3_psql --tuples-only -c "
+        WITH n AS (
+            SELECT ROW_NUMBER() OVER (ORDER BY p3_hex_distance(src.hex_q,src.hex_r,dest.hex_q,dest.hex_r)) AS rn,
+                   RPAD(dest.name, 14) ||
+                   RPAD(COALESCE(p3_hex_distance(src.hex_q,src.hex_r,dest.hex_q,dest.hex_r)::text||'hx','?'), 6) ||
+                   COALESCE(p3_travel_days(src.city_id,dest.city_id,5.0)::text,'?')||'d' AS entry
+            FROM p3_cities src, p3_cities dest
+            WHERE src.name='$city' AND dest.city_id<>src.city_id
+              AND dest.hex_q IS NOT NULL AND src.hex_q IS NOT NULL
+            ORDER BY p3_hex_distance(src.hex_q,src.hex_r,dest.hex_q,dest.hex_r) NULLS LAST
+            LIMIT 8
+        ),
+        odds  AS (SELECT rn,entry FROM n WHERE MOD(rn,2)=1),
+        evens AS (SELECT rn,entry FROM n WHERE MOD(rn,2)=0)
+        SELECT '  ' || RPAD(o.entry, 32) || '  ' || COALESCE(e.entry,'')
+        FROM odds o LEFT JOIN evens e ON e.rn = o.rn+1
+        ORDER BY o.rn;" 2>/dev/null \
+        | grep -v '^\s*$' || echo "  (no hex data)")
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    printf '%s  |  pop:%-7s  |  %s  |  region: %s  |  hex: %s  |  counting houses: %s\n' \
+        "${city^^}" "$ci_pop" "$ci_league" "$ci_region" "$ci_hex" "$ci_ch"
+    printf '%s\n' "$ruler"
+    printf 'PRODUCTION & DEMAND\n'
+    printf '  %-14s %-9s %-6s %s\n' "GOOD" "ROLE" "EFF" "OUTPUT/DAY"
+    printf '%s\n' "$city_prod_lines"
+    printf '%s\n' "$ruler"
+    printf 'SHIPS IN PORT\n'
+    printf '  %-22s %-10s %-7s %s\n' "NAME" "TYPE" "SPEED" "CAPACITY"
+    printf '%s\n' "$ships_in_port"
+    printf '%s\n' "$ruler"
+    printf 'NEAREST CITIES  (Snaikka 5kn travel time)\n'
+    printf '%s\n' "$nearby_lines"
+    printf '%s\n' "$ruler"
+}
+
 p3_interactive_buy() {
     local sid="$1" scity="$2"
     local gold cargo_free
@@ -2425,9 +2528,11 @@ p3_interactive_buy() {
 
     [[ -z "$goods_list" ]] && { warn "No market data for $scity."; return; }
 
-    # Let user scroll/filter the list
+    # Show city intel panel above the goods list
     clear
-    gum style --foreground 33 --bold "🛒  BUY GOODS — $scity  |  💰 ${gold}g  |  🚢 free cargo: ${cargo_free}"
+    p3_city_intel_panel "$scity"
+    echo
+    gum style --foreground 33 --bold "BUY GOODS — $scity  |  Gold: ${gold}g  |  Free cargo: ${cargo_free}"
     echo
     gum style --foreground 244 "  $(printf '%-14s  %-16s %-16s %-10s %s' 'GOOD' 'BUYING PRICE' 'SELLING PRICE' 'STOCK' 'SIG')"
     echo
@@ -2469,7 +2574,7 @@ p3_interactive_buy() {
     #   q=1  → ask*(stock/stock)^e  = ask  ✓
     #   q=2  → ask*(stock/(stock-1))^e > ask  ✓ (less stock = more expensive)
     clear
-    gum style --foreground 212 --bold "📈  MARGINAL PRICE CURVE — $good in $scity"
+    gum style --foreground 212 --bold "MARGINAL PRICE CURVE — $good in $scity"
     gum style --foreground 244 "    Current Buying Price: ${ask}g  |  Selling Price: ${bid}g  |  Stock: ${stock}  |  Your gold: ${gold}g"
     echo
     printf '  %-6s  %-12s  %-14s  %s\n' "QTY" "UNIT PRICE" "TOTAL COST" "AFFORDABLE?"
@@ -2513,7 +2618,7 @@ p3_interactive_buy() {
     done
 
     echo
-    gum style --foreground 33 --bold "  SUMMARY: Buy $qty × $good in $scity"
+    gum style --foreground 33 --bold "  SUMMARY: Buy $qty x $good in $scity"
     gum style --foreground 244 "  Unit range: ${ask}g (1st unit) → marginal pricing applied"
     gum style --foreground 76  "  Total cost: ${total_cost}g  |  Your gold: ${gold}g"
     echo
@@ -2641,7 +2746,7 @@ p3_interactive_sell() {
     done
 
     echo
-    gum style --foreground 214 --bold "  SUMMARY: Sell $qty × $good in $scity"
+    gum style --foreground 214 --bold "  SUMMARY: Sell $qty x $good in $scity"
     gum style --foreground 244 "  Unit range: ${bid}g (1st unit) → marginal pricing applied"
     gum style --foreground 76  "  Total revenue: ${total_revenue}g  |  Gold after: $(awk "BEGIN{printf \"%.2f\", $gold + $total_revenue}")g"
     echo
