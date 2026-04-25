@@ -14,11 +14,11 @@ p3_main_dashboard() {
     ruler_r=$(printf '─%.0s' $(seq 1 $((right_w - 4))))
 
     # ── Single DB round-trip ───────────────────────────────────────────────
-    local gold rank gyear gday docked sailing is_admin counting_houses visible_cities
+    local gold rank gyear gday docked sailing is_admin counting_houses visible_cities home_city
     {
         read -r gold; read -r rank; read -r gyear; read -r gday
         read -r docked; read -r sailing; read -r is_admin
-        read -r counting_houses; read -r visible_cities
+        read -r counting_houses; read -r visible_cities; read -r home_city
     } < <(p3_psql --tuples-only -c "
         SELECT pl.gold::text, pl.rank,
                pl.game_year::text, pl.game_day::text,
@@ -26,14 +26,16 @@ p3_main_dashboard() {
                (SELECT COUNT(*)::text FROM p3_ships WHERE owner='player' AND status='sailing'),
                pl.is_admin::text,
                (SELECT COUNT(*)::text FROM p3_counting_houses),
-               (SELECT COUNT(DISTINCT city_id)::text FROM p3_player_visible_city_ids())
+               (SELECT COUNT(DISTINCT city_id)::text FROM p3_player_visible_city_ids()),
+               pl.home_city
         FROM p3_player pl LIMIT 1;" 2>/dev/null \
         | sed 's/|/\n/g; s/^ *//; s/ *$//' \
-        || printf '???\nApprentice\n???\n0\n0\n0\nf\n0\n1\n')
+        || printf '???\nApprentice\n???\n0\n0\n0\nf\n0\n1\nLubeck\n')
 
     is_admin="${is_admin:-f}"
     counting_houses="${counting_houses:-0}"
     visible_cities="${visible_cities:-1}"
+    home_city="${home_city:-Lubeck}"
 
     # ── Fleet lines ────────────────────────────────────────────────────────
     local fleet_lines
@@ -87,18 +89,32 @@ p3_main_dashboard() {
         SELECT ci.population::text, ci.region, ci.league,
                COALESCE(ci.hex_q::text||','||ci.hex_r::text,'unmapped'),
                (SELECT COUNT(*)::text FROM p3_counting_houses)
-        FROM p3_cities ci WHERE ci.name='Lübeck' LIMIT 1;" 2>/dev/null \
+        FROM p3_cities ci WHERE ci.name='$home_city' LIMIT 1;" 2>/dev/null \
         | sed 's/|/\n/g; s/^ *//; s/ *$//' \
         || printf '?\nBaltic\nHanseatic\nunmapped\n0\n')
 
     # Market: fetch as pairs for 2-column layout
     local lub_market_2col
     lub_market_2col=$(p3_psql --tuples-only -c "
-        WITH numbered AS (
-            SELECT ROW_NUMBER() OVER (ORDER BY good) AS rn,
+        WITH src AS (
+            SELECT g.name AS good, m.current_buy AS ask, m.current_sell AS bid,
+                   m.stock,
+                   CASE
+                       WHEN m.current_buy  <= g.buy_price_min  THEN 'BUY'
+                       WHEN m.current_sell >= g.sell_price_max THEN 'SELL!'
+                       WHEN m.current_sell >= g.sell_price_min THEN 'SELL'
+                       ELSE '--'
+                   END AS signal
+            FROM p3_market m
+            JOIN p3_cities ci ON ci.city_id = m.city_id AND ci.name = '$home_city'
+            JOIN p3_goods  g  ON g.good_id  = m.good_id
+            ORDER BY g.name
+        ),
+        numbered AS (
+            SELECT ROW_NUMBER() OVER () AS rn,
                    RPAD(good, 12) || RPAD(ask::text, 9) || RPAD(bid::text, 8) ||
-                   RPAD(stock::text, 5) || COALESCE(signal,'–') AS entry
-            FROM p3_lubeck_market_view
+                   RPAD(stock::text, 5) || signal AS entry
+            FROM src
         ),
         odds  AS (SELECT rn, entry FROM numbered WHERE MOD(rn,2)=1),
         evens AS (SELECT rn, entry FROM numbered WHERE MOD(rn,2)=0)
@@ -116,7 +132,7 @@ p3_main_dashboard() {
                ROUND(g.base_production * cg.efficiency / 100.0, 3)::text || '/day'
         FROM p3_city_goods cg
         JOIN p3_goods  g  ON g.good_id  = cg.good_id
-        JOIN p3_cities ci ON ci.city_id = cg.city_id AND ci.name = 'Lübeck'
+        JOIN p3_cities ci ON ci.city_id = cg.city_id AND ci.name = '$home_city'
         ORDER BY cg.role DESC, g.name;" 2>/dev/null \
         | grep -v '^\s*$' || echo "  (no production data)")
 
@@ -127,7 +143,7 @@ p3_main_dashboard() {
                '  -> ' || g_out.name || '  (' || bt.daily_maintenance*pb.num_buildings || 'g/day maint)'
         FROM p3_player_buildings pb
         JOIN p3_building_types bt ON bt.building_type_id = pb.building_type_id
-        JOIN p3_cities ci ON ci.city_id = pb.city_id AND ci.name = 'Lubeck'
+        JOIN p3_cities ci ON ci.city_id = pb.city_id AND ci.name = '$home_city'
         JOIN p3_goods g_out ON g_out.good_id = bt.output_good_id
         ORDER BY bt.name;" 2>/dev/null \
         | grep -v '^\s*$' || echo "  none")
@@ -141,7 +157,7 @@ p3_main_dashboard() {
                ROUND(g.base_production * cg.efficiency / 100.0, 3)::text || '/day'
         FROM p3_city_goods cg
         JOIN p3_goods  g  ON g.good_id  = cg.good_id
-        JOIN p3_cities ci ON ci.city_id = cg.city_id AND ci.name = 'Lubeck'
+        JOIN p3_cities ci ON ci.city_id = cg.city_id AND ci.name = '$home_city'
         ORDER BY cg.role DESC, g.name;" 2>/dev/null \
         | grep -v '^\s*$' || echo "  (no city production data)")
 
@@ -154,7 +170,7 @@ p3_main_dashboard() {
                    RPAD(COALESCE(p3_hex_distance(0,0,dest.hex_q,dest.hex_r)::text||'hx','?'), 6) ||
                    COALESCE(p3_travel_days(src.city_id,dest.city_id,5.0)::text,'?')||'d' AS entry
             FROM p3_cities src, p3_cities dest
-            WHERE src.name='Lubeck' AND dest.city_id<>src.city_id
+            WHERE src.name='$home_city' AND dest.city_id<>src.city_id
               AND dest.hex_q IS NOT NULL AND src.hex_q IS NOT NULL
             ORDER BY p3_hex_distance(0,0,dest.hex_q,dest.hex_r) NULLS LAST
             LIMIT 8
@@ -180,8 +196,8 @@ p3_main_dashboard() {
             | grep -v '^\s*$' || echo "  (no arbitrage data)")
         panel_right=$(
         {
-            printf 'HOME  LUBECK  |  pop:%-7s  |  %s  [hex %s]  |  counting houses: %s\n' \
-                "$lub_pop" "$lub_league" "$lub_hex" "$lub_ch_count"
+            printf 'HOME  %s  |  pop:%-7s  |  %s  [hex %s]  |  counting houses: %s\n' \
+                "${home_city^^}" "$lub_pop" "$lub_league" "$lub_hex" "$lub_ch_count"
             printf '%s\n' "$ruler_r"
             printf '  %-12s %-9s %-8s %-5s  |  %-12s %-9s %-8s %-5s\n' \
                 "GOOD" "ASK" "BID" "STK" "GOOD" "ASK" "BID" "STK"
@@ -199,8 +215,8 @@ p3_main_dashboard() {
         rp_color=33
         panel_right=$(
         {
-            printf 'HOME  LUBECK  |  pop:%-7s  |  %s  |  region: %s  |  hex: %s  |  counting houses: %s\n' \
-                "$lub_pop" "$lub_league" "$lub_region" "$lub_hex" "$lub_ch_count"
+            printf 'HOME  %s  |  pop:%-7s  |  %s  |  region: %s  |  hex: %s  |  counting houses: %s\n' \
+                "${home_city^^}" "$lub_pop" "$lub_league" "$lub_region" "$lub_hex" "$lub_ch_count"
             printf '%s\n' "$ruler_r"
             printf '  %-12s %-9s %-8s %-5s  |  %-12s %-9s %-8s %-5s\n' \
                 "GOOD" "ASK" "BID" "STK" "GOOD" "ASK" "BID" "STK"
@@ -442,7 +458,7 @@ p3_interactive_buy() {
                '  BUY:'  || RPAD(m.current_buy::text, 9) ||
                'SELL:'   || RPAD(m.current_sell::text, 9) ||
                'STK:'    || RPAD(m.stock::text, 6) ||
-               COALESCE(mv.signal,'–')
+               COALESCE(mv.signal,'--')
         FROM   p3_market m
         JOIN   p3_goods   g  ON g.good_id  = m.good_id
         JOIN   p3_cities  ci ON ci.city_id = m.city_id AND ci.name = '$scity'

@@ -33,7 +33,10 @@
 #    bash app.sh
 # =============================================================================
 
-set -euo pipefail
+# Do NOT use set -e here — gum returns exit 1 on ESC/empty selection, and
+# psql subshells return non-zero on empty results. Both are normal game events.
+# Individual functions handle their own errors via || fallback patterns.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
