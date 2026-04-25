@@ -23,13 +23,19 @@
 #      main_menu.sh      ← patrician_menu (top-level action dispatcher)
 #    sql/
 #      schema.sql        ← CREATE TABLE / VIEW / FUNCTION  (apply with psql -f)
-#      seed.sql          ← INSERT reference data            (apply with psql -f)
+#      seed.sql          ← INSERT cities, goods, market data (apply with psql -f)
+#      hex_coords.sql    ← SET hex_q/hex_r on cities, bootstrap p3_hex_tiles
+#    scripts/
+#      latlon_to_hex.sh  ← utility: convert lat/lon → axial hex for new cities
+#    tools/
+#      hex_map.jsx       ← browser companion map (React, not sourced by app.sh)
 #
 #  DEPENDENCIES: psql  gum
 #
 #  QUICK START:
 #    psql -d traderdude -f sql/schema.sql
 #    psql -d traderdude -f sql/seed.sql
+#    psql -d traderdude -f sql/hex_coords.sql
 #    bash app.sh
 # =============================================================================
 
@@ -75,6 +81,14 @@ p3_seed_all() {
          -f "$SCRIPT_DIR/sql/seed.sql" >/dev/null \
     && success "Seed data applied." \
     || error "Seed apply failed — check sql/seed.sql."
+}
+
+p3_apply_hex_coords() {
+    info "Applying hex coordinates from sql/hex_coords.sql..."
+    psql -X --username="$P3_USER" --dbname="$P3_DB" \
+         -f "$SCRIPT_DIR/sql/hex_coords.sql" >/dev/null \
+    && success "Hex coordinates applied." \
+    || error "Hex coords apply failed — check sql/hex_coords.sql."
 }
 
 p3_drop_tables() {
@@ -125,6 +139,7 @@ p3_setup_all() {
     p3_drop_tables
     p3_create_tables
     p3_seed_all
+    p3_apply_hex_coords
     echo
     success "Patrician III + IV fully initialised!"
     info    "    Hanseatic cities: 24  |  Mediterranean cities: 10"

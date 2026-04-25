@@ -12,9 +12,9 @@ p3_interactive_buy() {
     local goods_list
     goods_list=$(p3_psql --tuples-only -c "
         SELECT RPAD(g.name, 14) ||
-               '  BUY:'  || RPAD(m.current_buy::text, 9) ||
-               'SELL:'   || RPAD(m.current_sell::text, 9) ||
-               'STK:'    || RPAD(m.stock::text, 6) ||
+               '  '  || RPAD(m.current_buy::text, 9) ||
+               '        '   || RPAD(m.current_sell::text, 9) ||
+               '        '    || RPAD(m.stock::text, 6) ||
                COALESCE(mv.signal,'–')
         FROM   p3_market m
         JOIN   p3_goods   g  ON g.good_id  = m.good_id

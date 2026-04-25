@@ -12,9 +12,9 @@ CREATE TABLE IF NOT EXISTS p3_player (
     home_city  TEXT          NOT NULL DEFAULT 'Lubeck',
     gold       NUMERIC(12,2) NOT NULL DEFAULT 2000,
     rank       TEXT          NOT NULL DEFAULT 'Apprentice',
-    game_year  INTEGER       NOT NULL DEFAULT 1300,
-    game_day   INTEGER       NOT NULL DEFAULT 1 CHECK (game_day BETWEEN 1 AND 360),
-    is_admin   BOOLEAN       NOT NULL DEFAULT FALSE
+    game_year  INTEGER       NOT NULL DEFAULT 1337,
+    game_day   INTEGER       NOT NULL DEFAULT 121 CHECK (game_day BETWEEN 1 AND 360),
+    is_admin   BOOLEAN       NOT NULL DEFAULT TRUE
 );
 
 -- ── Goods catalogue ───────────────────────────────────────────────────────
@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS p3_cities (
     region     TEXT    NOT NULL DEFAULT 'Baltic',
     population INTEGER NOT NULL DEFAULT 5000,
     league     TEXT    NOT NULL DEFAULT 'Hanseatic',
+    latitude   NUMERIC DEFAULT NULL,
+    longitude  NUMERIC DEFAULT NULL,
     hex_q      INTEGER DEFAULT NULL,
     hex_r      INTEGER DEFAULT NULL,
     notes      TEXT
